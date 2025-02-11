@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package session.v1;
+
+option go_package = "cbt-exam/api/proto/session/v1;sessionv1";
+
+import "google/protobuf/timestamp.proto";
+
+service SessionService {
+  // Session management
+  rpc StartSession(StartSessionRequest) returns (ExamSession) {}
+  rpc GetSession(GetSessionRequest) returns (ExamSession) {}
+  rpc SubmitAnswer(SubmitAnswerRequest) returns (SubmitAnswerResponse) {}
+  rpc FinishSession(FinishSessionRequest) returns (ExamSession) {}
+
+  // Timer management
+  rpc GetRemainingTime(GetRemainingTimeRequest) returns (GetRemainingTimeResponse) {}
+}
+
+message ExamSession {
+  string id = 1;
+  string exam_id = 2;
+  string student_id = 3;
+  SessionStatus status = 4;
+  google.protobuf.Timestamp start_time = 5;
+  google.protobuf.Timestamp end_time = 6;
+  repeated Answer answers = 7;
+}
+
+message Answer {
+  string question_id = 1;
+  string selected_choice = 2;
+  google.protobuf.Timestamp answered_at = 3;
+}
+
+message StartSessionRequest {
+  string exam_id = 1;
+  string student_id = 2;
+}
+
+message GetSessionRequest {
+  string id = 1;
+}
+
+message SubmitAnswerRequest {
+  string session_id = 1;
+  string question_id = 2;
+  string selected_choice = 3;
+}
+
+message SubmitAnswerResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message FinishSessionRequest {
+  string id = 1;
+}
+
+message GetRemainingTimeRequest {
+  string session_id = 1;
+}
+
+message GetRemainingTimeResponse {
+  int32 remaining_minutes = 1;
+  int32 remaining_seconds = 2;
+}
+
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_STATUS_STARTED = 1;
+  SESSION_STATUS_IN_PROGRESS = 2;
+  SESSION_STATUS_FINISHED = 3;
+  SESSION_STATUS_TIMEOUT = 4;
+}

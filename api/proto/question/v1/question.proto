@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package question.v1;
+
+option go_package = "cbt-exam/api/proto/question/v1;questionv1";
+
+import "google/protobuf/empty.proto";
+
+service QuestionService {
+  // Question management
+  rpc CreateQuestion(CreateQuestionRequest) returns (Question) {}
+  rpc GetQuestion(GetQuestionRequest) returns (Question) {}
+  rpc ListQuestions(ListQuestionsRequest) returns (ListQuestionsResponse) {}
+  rpc UpdateQuestion(UpdateQuestionRequest) returns (Question) {}
+  rpc DeleteQuestion(DeleteQuestionRequest) returns (google.protobuf.Empty) {}
+
+  // Exam questions
+  rpc GetExamQuestions(GetExamQuestionsRequest) returns (GetExamQuestionsResponse) {}
+}
+
+message Question {
+  string id = 1;
+  string exam_id = 2;
+  string question_text = 3;
+  repeated Choice choices = 4;
+  string correct_answer = 5;
+}
+
+message Choice {
+  string id = 1;
+  string text = 2;
+}
+
+message CreateQuestionRequest {
+  string exam_id = 1;
+  string question_text = 2;
+  repeated Choice choices = 3;
+  string correct_answer = 4;
+}
+
+message GetQuestionRequest {
+  string id = 1;
+}
+
+message ListQuestionsRequest {
+  string exam_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListQuestionsResponse {
+  repeated Question questions = 1;
+  string next_page_token = 2;
+}
+
+message UpdateQuestionRequest {
+  string id = 1;
+  Question question = 2;
+}
+
+message DeleteQuestionRequest {
+  string id = 1;
+}
+
+message GetExamQuestionsRequest {
+  string exam_id = 1;
+  bool randomize = 2;
+  int32 limit = 3;
+}
+
+message GetExamQuestionsResponse {
+  repeated Question questions = 1;
+}

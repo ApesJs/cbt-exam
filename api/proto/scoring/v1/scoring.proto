@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package scoring.v1;
+
+option go_package = "cbt-exam/api/proto/scoring/v1;scoringv1";
+
+import "google/protobuf/timestamp.proto";
+
+service ScoringService {
+  // Score management
+  rpc CalculateScore(CalculateScoreRequest) returns (ExamScore) {}
+  rpc GetScore(GetScoreRequest) returns (ExamScore) {}
+  rpc ListScores(ListScoresRequest) returns (ListScoresResponse) {}
+}
+
+message ExamScore {
+  string id = 1;
+  string exam_id = 2;
+  string session_id = 3;
+  string student_id = 4;
+  int32 total_questions = 5;
+  int32 correct_answers = 6;
+  int32 wrong_answers = 7;
+  int32 unanswered = 8;
+  float score = 9;
+  google.protobuf.Timestamp created_at = 10;
+}
+
+message CalculateScoreRequest {
+  string session_id = 1;
+}
+
+message GetScoreRequest {
+  string id = 1;
+}
+
+message ListScoresRequest {
+  string exam_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListScoresResponse {
+  repeated ExamScore scores = 1;
+  string next_page_token = 2;
+}

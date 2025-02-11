@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package exam.v1;
+
+option go_package = "cbt-exam/api/proto/exam/v1;examv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+service ExamService {
+  // Exam management
+  rpc CreateExam(CreateExamRequest) returns (Exam) {}
+  rpc GetExam(GetExamRequest) returns (Exam) {}
+  rpc ListExams(ListExamsRequest) returns (ListExamsResponse) {}
+  rpc UpdateExam(UpdateExamRequest) returns (Exam) {}
+  rpc DeleteExam(DeleteExamRequest) returns (google.protobuf.Empty) {}
+
+  // Exam session management
+  rpc ActivateExam(ActivateExamRequest) returns (Exam) {}
+  rpc DeactivateExam(DeactivateExamRequest) returns (Exam) {}
+  rpc GetExamStatus(GetExamStatusRequest) returns (ExamStatus) {}
+}
+
+message Exam {
+  string id = 1;
+  string title = 2;
+  string subject = 3;
+  int32 duration_minutes = 4;
+  int32 total_questions = 5;
+  bool is_random = 6;
+  string teacher_id = 7;
+  repeated string class_ids = 8;
+  ExamStatus status = 9;
+  google.protobuf.Timestamp start_time = 10;
+  google.protobuf.Timestamp end_time = 11;
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp updated_at = 13;
+}
+
+message CreateExamRequest {
+  string title = 1;
+  string subject = 2;
+  int32 duration_minutes = 3;
+  int32 total_questions = 4;
+  bool is_random = 5;
+  string teacher_id = 6;
+  repeated string class_ids = 7;
+}
+
+message GetExamRequest {
+  string id = 1;
+}
+
+message ListExamsRequest {
+  string teacher_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListExamsResponse {
+  repeated Exam exams = 1;
+  string next_page_token = 2;
+}
+
+message UpdateExamRequest {
+  string id = 1;
+  Exam exam = 2;
+}
+
+message DeleteExamRequest {
+  string id = 1;
+}
+
+message ActivateExamRequest {
+  string id = 1;
+  repeated string class_ids = 2;
+}
+
+message DeactivateExamRequest {
+  string id = 1;
+}
+
+message GetExamStatusRequest {
+  string id = 1;
+}
+
+message ExamStatus {
+  string id = 1;
+  string exam_id = 2;
+  ExamState state = 3;
+  int32 total_students = 4;
+  int32 students_started = 5;
+  int32 students_finished = 6;
+  repeated StudentStatus student_statuses = 7;
+}
+
+message StudentStatus {
+  string student_id = 1;
+  string student_name = 2;
+  string class_id = 3;
+  ExamStudentState state = 4;
+  google.protobuf.Timestamp start_time = 5;
+  google.protobuf.Timestamp end_time = 6;
+}
+
+enum ExamState {
+  EXAM_STATE_UNSPECIFIED = 0;
+  EXAM_STATE_CREATED = 1;
+  EXAM_STATE_ACTIVE = 2;
+  EXAM_STATE_FINISHED = 3;
+}
+
+enum ExamStudentState {
+  EXAM_STUDENT_STATE_UNSPECIFIED = 0;
+  EXAM_STUDENT_STATE_NOT_STARTED = 1;
+  EXAM_STUDENT_STATE_IN_PROGRESS = 2;
+  EXAM_STUDENT_STATE_FINISHED = 3;
+}
