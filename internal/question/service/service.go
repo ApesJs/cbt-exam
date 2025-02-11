@@ -4,9 +4,9 @@ import (
 	"context"
 	"google.golang.org/protobuf/types/known/emptypb"
 
-	questionv1 "cbt-exam/api/proto/question/v1"
-	"cbt-exam/internal/question/domain"
-	"cbt-exam/internal/question/repository"
+	questionv1 "github.com/ApesJs/cbt-exam/api/proto/question/v1"
+	"github.com/ApesJs/cbt-exam/internal/question/domain"
+	"github.com/ApesJs/cbt-exam/internal/question/repository"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

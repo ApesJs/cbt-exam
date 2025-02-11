@@ -10,9 +10,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	examv1 "cbt-exam/api/proto/exam/v1"
-	"cbt-exam/internal/exam/domain"
-	"cbt-exam/internal/exam/repository"
+	examv1 "github.com/ApesJs/cbt-exam/api/proto/exam/v1"
+	"github.com/ApesJs/cbt-exam/internal/exam/domain"
+	"github.com/ApesJs/cbt-exam/internal/exam/repository"
 )
 
 type examService struct {

@@ -14,10 +14,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
-	examv1 "cbt-exam/api/proto/exam/v1"
-	"cbt-exam/internal/exam/repository/postgres"
-	"cbt-exam/internal/exam/service"
-	"cbt-exam/pkg/config"
+	examv1 "github.com/ApesJs/cbt-exam/api/proto/exam/v1"
+	"github.com/ApesJs/cbt-exam/internal/exam/repository/postgres"
+	"github.com/ApesJs/cbt-exam/internal/exam/service"
+	"github.com/ApesJs/cbt-exam/pkg/config"
 )
 
 func main() {

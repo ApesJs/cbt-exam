@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package session.v1;
 
-option go_package = "cbt-exam/api/proto/session/v1;sessionv1";
+option go_package = "github.com/ApesJs/cbt-exam/api/proto/session/v1;sessionv1";
 
 import "google/protobuf/timestamp.proto";
 

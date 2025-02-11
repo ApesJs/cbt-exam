@@ -1,4 +1,4 @@
-module cbt-exam
+module github.com/ApesJs/cbt-exam
 
 go 1.23
 

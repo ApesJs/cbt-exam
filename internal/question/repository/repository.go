@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"cbt-exam/internal/question/domain"
+	"github.com/ApesJs/cbt-exam/internal/question/domain"
 )
 
 type QuestionRepository interface {

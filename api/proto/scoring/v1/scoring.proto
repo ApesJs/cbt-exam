@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package scoring.v1;
 
-option go_package = "cbt-exam/api/proto/scoring/v1;scoringv1";
+option go_package = "github.com/ApesJs/cbt-exam/api/proto/scoring/v1;scoringv1";
 
 import "google/protobuf/timestamp.proto";
 

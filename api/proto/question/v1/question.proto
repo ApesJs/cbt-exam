@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package question.v1;
 
-option go_package = "cbt-exam/api/proto/question/v1;questionv1";
+option go_package = "github.com/ApesJs/cbt-exam/api/proto/question/v1;questionv1";
 
 import "google/protobuf/empty.proto";
 

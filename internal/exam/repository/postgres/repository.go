@@ -6,8 +6,8 @@ import (
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
 
-	"cbt-exam/internal/exam/domain"
-	"cbt-exam/internal/exam/repository"
+	"github.com/ApesJs/cbt-exam/internal/exam/domain"
+	"github.com/ApesJs/cbt-exam/internal/exam/repository"
 )
 
 type postgresRepository struct {
