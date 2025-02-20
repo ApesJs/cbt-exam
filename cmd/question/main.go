@@ -17,6 +17,7 @@ import (
 	questionv1 "github.com/ApesJs/cbt-exam/api/proto/question/v1"
 	"github.com/ApesJs/cbt-exam/internal/question/repository/postgres"
 	"github.com/ApesJs/cbt-exam/internal/question/service"
+	"github.com/ApesJs/cbt-exam/pkg/client"
 	"github.com/ApesJs/cbt-exam/pkg/config"
 )
 
@@ -25,6 +26,17 @@ func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Initialize service pkgClient
+	pkgClient, err := client.NewServiceClient(
+		cfg.ExamPort,
+		cfg.QuestionPort,
+		cfg.SessionPort,
+		cfg.ScoringPort,
+	)
+	if err != nil {
+		log.Fatalf("Failed to create service pkgClient: %v", err)
 	}
 
 	// Initialize PostgreSQL connection
@@ -43,7 +55,7 @@ func main() {
 	repo := postgres.NewPostgresRepository(db)
 
 	// Initialize service
-	svc := service.NewQuestionService(repo)
+	svc := service.NewQuestionService(repo, pkgClient)
 
 	// Initialize gRPC server
 	server := grpc.NewServer()
