@@ -24,24 +24,21 @@ type Config struct {
 
 func Load() (*Config, error) {
 	// Set default values
-	setDefaults()
+	//setDefaults()
 
-	// Setup viper
-	viper.SetConfigName("config")   // nama file config tanpa ekstensi
-	viper.SetConfigType("yaml")     // tipe file config
-	viper.AddConfigPath(".")        // lokasi file config
-	viper.AddConfigPath("./config") // lokasi alternatif
+	viper.SetConfigName(".env")
+	viper.SetConfigType("env")
+	viper.AddConfigPath(".")
 
-	// Enable automatic environment variable binding
 	viper.AutomaticEnv()
 
 	// Read config file if exists
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			return nil, fmt.Errorf("error reading config file: %v", err)
+			return nil, fmt.Errorf("error loading .env file: %v", err)
 		}
 		// Config file not found, will use defaults and env vars
-		fmt.Println("No config file found, using defaults and environment variables")
+		fmt.Println("No .env file found, using environment variables or defaults")
 	}
 
 	var config Config
@@ -62,26 +59,26 @@ func Load() (*Config, error) {
 	return &config, nil
 }
 
-func setDefaults() {
-	// Service ports
-	viper.SetDefault("PORT", 8080)           // Default main port
-	viper.SetDefault("EXAM_PORT", 50051)     // Exam service port
-	viper.SetDefault("QUESTION_PORT", 50052) // Question service port
-	viper.SetDefault("SESSION_PORT", 50053)  // Session service port
-	viper.SetDefault("SCORING_PORT", 50054)  // Scoring service port
-
-	// Database defaults
-	viper.SetDefault("DB_HOST", "localhost")
-	viper.SetDefault("DB_PORT", 5432)
-	viper.SetDefault("DB_NAME", "cbt_exam")
-	viper.SetDefault("DB_USER", "root")
-	viper.SetDefault("DB_PASS", "secret")
-	viper.SetDefault("DB_SSL", "disable")
-	
-	// Default database URL (will be overridden if individual components are set)
-	viper.SetDefault("DATABASE_URL", "postgres://root:secret@localhost:5432/cbt_exam?sslmode=disable")
-
-}
+//func setDefaults() {
+//	// Service ports
+//	//viper.SetDefault("PORT", 8080)           // Default main port
+//	viper.SetDefault("EXAM_PORT", 50051)     // Exam service port
+//	viper.SetDefault("QUESTION_PORT", 50052) // Question service port
+//	viper.SetDefault("SESSION_PORT", 50053)  // Session service port
+//	viper.SetDefault("SCORING_PORT", 50054)  // Scoring service port
+//
+//	// Database defaults
+//	viper.SetDefault("DB_HOST", "localhost")
+//	viper.SetDefault("DB_PORT", 5432)
+//	viper.SetDefault("DB_NAME", "cbt_exam")
+//	viper.SetDefault("DB_USER", "root")
+//	viper.SetDefault("DB_PASS", "secret")
+//	viper.SetDefault("DB_SSL", "disable")
+//
+//	// Default database URL (will be overridden if individual components are set)
+//	viper.SetDefault("DATABASE_URL", "postgres://root:secret@localhost:5432/cbt_exam?sslmode=disable")
+//
+//}
 
 func buildDatabaseURL(config Config) string {
 	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s",

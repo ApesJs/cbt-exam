@@ -21,6 +21,11 @@ type MockSessionRepository struct {
 	mock.Mock
 }
 
+func (m *MockSessionRepository) CleanupExpiredSessions(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
 // Implementasi metode-metode dari repository.SessionRepository
 func (m *MockSessionRepository) StartSession(ctx context.Context, session *domain.ExamSession) error {
 	args := m.Called(ctx, session)

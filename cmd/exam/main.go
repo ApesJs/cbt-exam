@@ -31,7 +31,7 @@ func main() {
 	// Override port from environment variable if exists
 	if portStr := os.Getenv("PORT"); portStr != "" {
 		if portNum, err := strconv.Atoi(portStr); err == nil {
-			cfg.Port = portNum
+			cfg.ExamPort = portNum
 			log.Printf("Using port from environment: %d", portNum)
 		} else {
 			log.Printf("Invalid PORT environment variable: %s", portStr)
@@ -65,7 +65,7 @@ func main() {
 	reflection.Register(server)
 
 	// Start listening
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.Port))
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.ExamPort))
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
@@ -76,7 +76,7 @@ func main() {
 
 	// Start server in a goroutine
 	go func() {
-		log.Printf("Starting exam service on port %d", cfg.Port)
+		log.Printf("Starting exam service on port %d", cfg.ExamPort)
 		if err := server.Serve(lis); err != nil {
 			log.Fatalf("Failed to serve: %v", err)
 		}
