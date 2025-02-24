@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	_ "github.com/lib/pq"
@@ -27,6 +28,16 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	// Override port from environment variable if exists
+	if portStr := os.Getenv("PORT"); portStr != "" {
+		if portNum, err := strconv.Atoi(portStr); err == nil {
+			cfg.Port = portNum
+			log.Printf("Using port from environment: %d", portNum)
+		} else {
+			log.Printf("Invalid PORT environment variable: %s", portStr)
+		}
+	}
+
 	// Initialize PostgreSQL connection
 	db, err := sql.Open("postgres", cfg.DatabaseURL)
 	if err != nil {
@@ -38,6 +49,7 @@ func main() {
 	if err := db.Ping(); err != nil {
 		log.Fatalf("Failed to ping database: %v", err)
 	}
+	log.Println("Successfully connected to database")
 
 	// Initialize repository
 	repo := postgres.NewPostgresRepository(db)
@@ -62,14 +74,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Start server in a goroutine
 	go func() {
-		<-ctx.Done()
-		log.Println("Shutting down server...")
-		server.GracefulStop()
+		log.Printf("Starting exam service on port %d", cfg.Port)
+		if err := server.Serve(lis); err != nil {
+			log.Fatalf("Failed to serve: %v", err)
+		}
 	}()
 
-	log.Printf("Starting exam service on port %d", cfg.Port)
-	if err := server.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
-	}
+	// Wait for interrupt signal
+	<-ctx.Done()
+	log.Println("Shutting down server...")
+
+	// Gracefully stop the server
+	server.GracefulStop()
+	log.Println("Server stopped")
 }

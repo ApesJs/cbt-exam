@@ -1,3 +1,4 @@
+// internal/session/repository/repository.go
 package repository
 
 import (
@@ -21,6 +22,9 @@ type SessionRepository interface {
 	// Validations
 	IsExamActive(ctx context.Context, examID string) (bool, error)
 	HasActiveSession(ctx context.Context, studentID string) (bool, error)
+
+	// Session cleanup
+	CleanupExpiredSessions(ctx context.Context) error
 }
 
 // Errors

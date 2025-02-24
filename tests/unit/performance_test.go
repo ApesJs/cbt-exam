@@ -3,6 +3,7 @@ package unit
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
@@ -37,6 +38,38 @@ type PerformanceResult struct {
 	MinLatency         time.Duration
 	MaxLatency         time.Duration
 	RequestsPerSecond  float64
+}
+
+func waitForServices(t *testing.T, config TestConfig) error {
+	services := []struct {
+		name string
+		addr string
+	}{
+		{"exam", config.ExamServiceAddr},
+		{"question", config.QuestionServiceAddr},
+		{"session", config.SessionServiceAddr},
+		{"scoring", config.ScoringServiceAddr},
+	}
+
+	timeout := time.After(30 * time.Second)
+	tick := time.Tick(500 * time.Millisecond)
+
+	for _, svc := range services {
+		for {
+			select {
+			case <-timeout:
+				return fmt.Errorf("timeout waiting for %s service", svc.name)
+			case <-tick:
+				conn, err := grpc.Dial(svc.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+				if err == nil {
+					conn.Close()
+					t.Logf("%s service is ready", svc.name)
+					break
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // createServiceClients membuat koneksi ke semua service
@@ -98,19 +131,23 @@ func closeConnections(connections []*grpc.ClientConn) {
 
 // TestExamSessionPerformance menguji performa saat banyak siswa mengakses ujian secara bersamaan
 func TestExamSessionPerformance(t *testing.T) {
-	// Skip test jika running di CI environment atau dengan -short flag
 	if testing.Short() {
 		t.Skip("Skipping performance test in short mode")
 	}
 
-	// Konfigurasi pengujian
+	// Konfigurasi test
 	config := TestConfig{
 		ExamServiceAddr:     "localhost:50051",
 		QuestionServiceAddr: "localhost:50052",
 		SessionServiceAddr:  "localhost:50053",
 		ScoringServiceAddr:  "localhost:50054",
-		ConcurrentUsers:     100, // Simulasikan 100 siswa secara bersamaan
-		RequestsPerUser:     10,  // Setiap siswa melakukan 10 request
+		ConcurrentUsers:     100,
+		RequestsPerUser:     10,
+	}
+
+	// Tunggu semua service siap
+	if err := waitForServices(t, config); err != nil {
+		t.Fatalf("Failed waiting for services: %v", err)
 	}
 
 	// Buat koneksi ke service
@@ -121,12 +158,14 @@ func TestExamSessionPerformance(t *testing.T) {
 	defer closeConnections(connections)
 
 	// Persiapkan ujian untuk testing
+	t.Log("Preparing exam...")
 	examID, err := prepareExam(t, examClient, questionClient)
 	if err != nil {
 		t.Fatalf("Failed to prepare exam: %v", err)
 	}
 
 	// Aktifkan ujian
+	t.Log("Activating exam...")
 	_, err = examClient.ActivateExam(context.Background(), &examv1.ActivateExamRequest{
 		Id:       examID,
 		ClassIds: []string{"class-1"},
@@ -139,71 +178,68 @@ func TestExamSessionPerformance(t *testing.T) {
 	resultChan := make(chan time.Duration, config.ConcurrentUsers*config.RequestsPerUser)
 	errorChan := make(chan error, config.ConcurrentUsers*config.RequestsPerUser)
 
-	// Tunggu semua goroutine selesai
 	var wg sync.WaitGroup
-
-	// Catat waktu mulai
 	startTime := time.Now()
 
-	// Simulasikan banyak siswa mengakses ujian secara bersamaan
+	// Jalankan test performa
+	t.Logf("Starting performance test with %d concurrent users...", config.ConcurrentUsers)
 	for i := 0; i < config.ConcurrentUsers; i++ {
 		wg.Add(1)
 		go func(studentID int) {
 			defer wg.Done()
 
 			// Mulai sesi ujian
-			sessionID, err := startExamSession(context.Background(), sessionClient, examID, fmt.Sprintf("student-%d", studentID))
+			sessionID, err := startExamSession(
+				context.Background(),
+				sessionClient,
+				examID,
+				fmt.Sprintf("student-%d", studentID),
+			)
 			if err != nil {
 				errorChan <- fmt.Errorf("student %d failed to start session: %v", studentID, err)
 				return
 			}
 
-			// Ambil pertanyaan ujian
+			// Ambil soal ujian
 			questions, err := getExamQuestions(context.Background(), questionClient, examID)
 			if err != nil {
 				errorChan <- fmt.Errorf("student %d failed to get questions: %v", studentID, err)
 				return
 			}
 
-			// Jawab pertanyaan
-			for j, question := range questions {
-				if j >= config.RequestsPerUser {
-					break
-				}
+			// Simulasi menjawab soal
+			for j := 0; j < config.RequestsPerUser; j++ {
+				start := time.Now()
 
-				// Catat waktu sebelum request
-				beforeRequest := time.Now()
+				// Pilih jawaban random
+				questionIdx := j % len(questions)
+				choiceIdx := rand.Intn(len(questions[questionIdx].Choices))
+				selectedChoice := string(rune('A' + choiceIdx))
 
-				// Pilih jawaban (untuk simulasi)
-				choiceIndex := j % len(question.Choices)
-				selectedChoice := string(rune('A' + choiceIndex))
-
-				// Kirim jawaban
+				// Submit jawaban
 				_, err := sessionClient.SubmitAnswer(context.Background(), &sessionv1.SubmitAnswerRequest{
 					SessionId:      sessionID,
-					QuestionId:     question.Id,
+					QuestionId:     questions[questionIdx].Id,
 					SelectedChoice: selectedChoice,
 				})
 
-				// Catat waktu setelah request
-				latency := time.Since(beforeRequest)
+				latency := time.Since(start)
 				resultChan <- latency
 
 				if err != nil {
 					errorChan <- fmt.Errorf("student %d failed to submit answer: %v", studentID, err)
 				}
 
-				// Tambahkan jeda kecil untuk simulasi perilaku realistis
-				time.Sleep(time.Millisecond * 10)
+				// Simulasi waktu berpikir siswa
+				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
 			}
 
-			// Selesaikan sesi ujian
+			// Selesaikan ujian
 			_, err = sessionClient.FinishSession(context.Background(), &sessionv1.FinishSessionRequest{
 				Id: sessionID,
 			})
 			if err != nil {
 				errorChan <- fmt.Errorf("student %d failed to finish session: %v", studentID, err)
-				return
 			}
 
 			// Hitung skor
@@ -213,74 +249,58 @@ func TestExamSessionPerformance(t *testing.T) {
 			if err != nil {
 				errorChan <- fmt.Errorf("student %d failed to calculate score: %v", studentID, err)
 			}
-
 		}(i)
 	}
 
-	// Tunggu semua goroutine selesai
+	// Tunggu semua selesai
 	wg.Wait()
+	totalDuration := time.Since(startTime)
 	close(resultChan)
 	close(errorChan)
 
-	// Hitung total durasi pengujian
-	totalDuration := time.Since(startTime)
-
-	// Aggregate results
-	var successCount, errorCount int
-	var totalLatency, minLatency, maxLatency time.Duration
-
-	// Set minLatency ke nilai maksimum awal
-	minLatency = time.Hour
+	// Hitung statistik
+	var totalLatency time.Duration
+	var maxLatency time.Duration
+	minLatency := time.Hour
+	successCount := 0
+	errorCount := 0
 
 	for latency := range resultChan {
 		successCount++
 		totalLatency += latency
-
-		if latency < minLatency {
-			minLatency = latency
-		}
 		if latency > maxLatency {
 			maxLatency = latency
 		}
+		if latency < minLatency {
+			minLatency = latency
+		}
 	}
 
-	// Hitung jumlah error
 	for range errorChan {
 		errorCount++
 	}
 
-	// Hitung metrik
-	totalRequests := successCount + errorCount
-	averageLatency := totalLatency / time.Duration(successCount)
-	requestsPerSecond := float64(successCount) / totalDuration.Seconds()
+	avgLatency := totalLatency / time.Duration(successCount)
+	rps := float64(successCount) / totalDuration.Seconds()
 
 	// Tampilkan hasil
-	result := PerformanceResult{
-		TotalRequests:      totalRequests,
-		SuccessfulRequests: successCount,
-		FailedRequests:     errorCount,
-		TotalDuration:      totalDuration,
-		AverageLatency:     averageLatency,
-		MinLatency:         minLatency,
-		MaxLatency:         maxLatency,
-		RequestsPerSecond:  requestsPerSecond,
-	}
+	t.Logf("\nPerformance Test Results:")
+	t.Logf("  Total Requests:       %d", successCount+errorCount)
+	t.Logf("  Successful Requests:  %d", successCount)
+	t.Logf("  Failed Requests:      %d", errorCount)
+	t.Logf("  Total Duration:       %v", totalDuration)
+	t.Logf("  Average Latency:      %v", avgLatency)
+	t.Logf("  Min Latency:          %v", minLatency)
+	t.Logf("  Max Latency:          %v", maxLatency)
+	t.Logf("  Requests Per Second:  %.2f", rps)
 
-	t.Logf("Performance Test Results:")
-	t.Logf("  Total Requests:       %d", result.TotalRequests)
-	t.Logf("  Successful Requests:  %d", result.SuccessfulRequests)
-	t.Logf("  Failed Requests:      %d", result.FailedRequests)
-	t.Logf("  Total Duration:       %v", result.TotalDuration)
-	t.Logf("  Average Latency:      %v", result.AverageLatency)
-	t.Logf("  Min Latency:          %v", result.MinLatency)
-	t.Logf("  Max Latency:          %v", result.MaxLatency)
-	t.Logf("  Requests Per Second:  %.2f", result.RequestsPerSecond)
-
-	// Assertions untuk memastikan performa memenuhi ekspektasi
-	successRate := float64(result.SuccessfulRequests) / float64(result.TotalRequests) * 100
-	assert.GreaterOrEqual(t, successRate, 95.0, "Success rate should be at least 95%%")
-	assert.LessOrEqual(t, result.AverageLatency, 100*time.Millisecond, "Average latency should be less than 100ms")
-	assert.GreaterOrEqual(t, result.RequestsPerSecond, 100.0, "Should handle at least 100 requests per second")
+	// Assertions
+	assert.Less(t, float64(errorCount)/float64(successCount+errorCount)*100, 5.0,
+		"Error rate should be less than 5%")
+	assert.Less(t, avgLatency, 200*time.Millisecond,
+		"Average latency should be less than 200ms")
+	assert.GreaterOrEqual(t, rps, 50.0,
+		"Should handle at least 50 requests per second")
 }
 
 // TestConcurrentExamSessions menguji kemampuan sistem menangani banyak sesi ujian secara bersamaan

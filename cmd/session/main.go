@@ -8,13 +8,17 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
+	"time"
 
 	_ "github.com/lib/pq"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 
 	sessionv1 "github.com/ApesJs/cbt-exam/api/proto/session/v1"
+	"github.com/ApesJs/cbt-exam/internal/session/repository"
 	"github.com/ApesJs/cbt-exam/internal/session/repository/postgres"
 	"github.com/ApesJs/cbt-exam/internal/session/service"
 	"github.com/ApesJs/cbt-exam/pkg/config"
@@ -27,17 +31,52 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Initialize PostgreSQL connection
-	db, err := sql.Open("postgres", cfg.DatabaseURL)
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+	// Override port from environment variable if exists
+	if portStr := os.Getenv("PORT"); portStr != "" {
+		if portNum, err := strconv.Atoi(portStr); err == nil {
+			cfg.Port = portNum
+			log.Printf("Using port from environment: %d", portNum)
+		} else {
+			log.Printf("Invalid PORT environment variable: %s", portStr)
+		}
+	}
+
+	// Initialize PostgreSQL connection with retry mechanism
+	var db *sql.DB
+	maxRetries := 5
+	retryDelay := time.Second * 3
+
+	for i := 0; i < maxRetries; i++ {
+		db, err = sql.Open("postgres", cfg.DatabaseURL)
+		if err != nil {
+			log.Printf("Attempt %d: Failed to connect to database: %v", i+1, err)
+			if i < maxRetries-1 {
+				time.Sleep(retryDelay)
+				continue
+			}
+			log.Fatalf("Failed to connect to database after %d attempts", maxRetries)
+		}
+
+		// Test database connection
+		if err := db.Ping(); err != nil {
+			log.Printf("Attempt %d: Failed to ping database: %v", i+1, err)
+			if i < maxRetries-1 {
+				time.Sleep(retryDelay)
+				continue
+			}
+			log.Fatalf("Failed to ping database after %d attempts", maxRetries)
+		}
+
+		break
 	}
 	defer db.Close()
 
-	// Test database connection
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Failed to ping database: %v", err)
-	}
+	log.Println("Successfully connected to database")
+
+	// Configure database connection pool
+	db.SetMaxOpenConns(50) // Higher connection limit for session service
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(time.Minute * 5)
 
 	// Initialize repository
 	repo := postgres.NewPostgresRepository(db)
@@ -45,8 +84,27 @@ func main() {
 	// Initialize service
 	svc := service.NewSessionService(repo)
 
-	// Initialize gRPC server
-	server := grpc.NewServer()
+	// Configure keepalive options
+	kaep := keepalive.EnforcementPolicy{
+		MinTime:             5 * time.Second,
+		PermitWithoutStream: true,
+	}
+	kasp := keepalive.ServerParameters{
+		MaxConnectionIdle:     15 * time.Minute,
+		MaxConnectionAge:      30 * time.Minute,
+		MaxConnectionAgeGrace: 5 * time.Minute,
+		Time:                  5 * time.Second,
+		Timeout:               1 * time.Second,
+	}
+
+	// Initialize gRPC server with options
+	serverOptions := []grpc.ServerOption{
+		grpc.KeepaliveEnforcementPolicy(kaep),
+		grpc.KeepaliveParams(kasp),
+		grpc.MaxConcurrentStreams(1000),
+		grpc.MaxRecvMsgSize(4 * 1024 * 1024), // 4MB
+	}
+	server := grpc.NewServer(serverOptions...)
 	sessionv1.RegisterSessionServiceServer(server, svc)
 
 	// Enable reflection for development tools
@@ -62,14 +120,92 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Channels untuk koordinasi shutdown
+	shutdownComplete := make(chan struct{})
+	serverError := make(chan error, 1)
+
+	// Start server in a goroutine
 	go func() {
-		<-ctx.Done()
-		log.Println("Shutting down server...")
-		server.GracefulStop()
+		log.Printf("Starting session service on port %d", cfg.Port)
+		if err := server.Serve(lis); err != nil {
+			serverError <- fmt.Errorf("failed to serve: %v", err)
+			return
+		}
+		close(shutdownComplete)
 	}()
 
-	log.Printf("Starting session service on port %d", cfg.Port)
-	if err := server.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+	// Start session cleanup goroutine
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := cleanupExpiredSessions(repo); err != nil {
+					log.Printf("Error cleaning up expired sessions: %v", err)
+				}
+			}
+		}
+	}()
+
+	// Monitor channels untuk shutdown atau error
+	select {
+	case <-ctx.Done():
+		log.Println("Received shutdown signal. Initiating graceful shutdown...")
+
+		// Create shutdown timeout context
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Graceful shutdown dengan timeout
+		shutdownChan := make(chan struct{})
+		go func() {
+			server.GracefulStop()
+			close(shutdownChan)
+		}()
+
+		select {
+		case <-shutdownChan:
+			log.Println("Server shutdown gracefully")
+		case <-shutdownCtx.Done():
+			log.Println("Server shutdown timeout exceeded, forcing shutdown")
+			server.Stop()
+		}
+
+	case err := <-serverError:
+		log.Printf("Server error: %v", err)
 	}
+
+	// Final cleanup
+	log.Println("Cleaning up resources...")
+
+	// Close database connections
+	if err := db.Close(); err != nil {
+		log.Printf("Error closing database connection: %v", err)
+	}
+
+	// Wait for all connections to close
+	select {
+	case <-shutdownComplete:
+		log.Println("Server shutdown complete")
+	case <-time.After(5 * time.Second):
+		log.Println("Server shutdown timed out")
+	}
+
+	log.Println("Service stopped")
+}
+
+// cleanupExpiredSessions menghapus sesi yang sudah expired
+func cleanupExpiredSessions(repo repository.SessionRepository) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	if err := repo.CleanupExpiredSessions(ctx); err != nil {
+		return fmt.Errorf("failed to cleanup expired sessions: %v", err)
+	}
+
+	return nil
 }

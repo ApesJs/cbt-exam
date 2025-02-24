@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	_ "github.com/lib/pq"
@@ -28,7 +29,17 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Initialize service pkgClient
+	// Override port from environment variable if exists
+	if portStr := os.Getenv("PORT"); portStr != "" {
+		if portNum, err := strconv.Atoi(portStr); err == nil {
+			cfg.Port = portNum
+			log.Printf("Using port from environment: %d", portNum)
+		} else {
+			log.Printf("Invalid PORT environment variable: %s", portStr)
+		}
+	}
+
+	// Initialize service client
 	pkgClient, err := client.NewServiceClient(
 		cfg.ExamPort,
 		cfg.QuestionPort,
@@ -36,7 +47,7 @@ func main() {
 		cfg.ScoringPort,
 	)
 	if err != nil {
-		log.Fatalf("Failed to create service pkgClient: %v", err)
+		log.Fatalf("Failed to create service client: %v", err)
 	}
 
 	// Initialize PostgreSQL connection
@@ -50,6 +61,7 @@ func main() {
 	if err := db.Ping(); err != nil {
 		log.Fatalf("Failed to ping database: %v", err)
 	}
+	log.Println("Successfully connected to database")
 
 	// Initialize repository
 	repo := postgres.NewPostgresRepository(db)
@@ -74,14 +86,31 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Channel untuk notifikasi server shutdown
+	shutdownComplete := make(chan struct{})
+
+	// Start server in a goroutine
 	go func() {
-		<-ctx.Done()
-		log.Println("Shutting down server...")
-		server.GracefulStop()
+		log.Printf("Starting question service on port %d", cfg.Port)
+		if err := server.Serve(lis); err != nil {
+			log.Printf("Server error: %v", err)
+		}
+		close(shutdownComplete)
 	}()
 
-	log.Printf("Starting question service on port %d", cfg.Port)
-	if err := server.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+	// Wait for interrupt signal
+	<-ctx.Done()
+	log.Println("Received shutdown signal. Initiating graceful shutdown...")
+
+	// Gracefully stop the server
+	server.GracefulStop()
+
+	// Wait for server to complete shutdown
+	<-shutdownComplete
+	log.Println("Server shutdown complete")
+
+	// Additional cleanup
+	if err := db.Close(); err != nil {
+		log.Printf("Error closing database connection: %v", err)
 	}
 }

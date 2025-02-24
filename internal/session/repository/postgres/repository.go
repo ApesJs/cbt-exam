@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"github.com/pkg/errors"
+	"log"
 
 	"github.com/ApesJs/cbt-exam/internal/session/domain"
 	"github.com/ApesJs/cbt-exam/internal/session/repository"
@@ -11,6 +12,29 @@ import (
 
 type postgresRepository struct {
 	db *sql.DB
+}
+
+// internal/session/repository/postgres/repository.go
+func (r *postgresRepository) CleanupExpiredSessions(ctx context.Context) error {
+	const query = `
+        UPDATE exam_sessions 
+        SET status = 'TIMEOUT', 
+            end_time = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status IN ('STARTED', 'IN_PROGRESS')
+        AND start_time + (duration_minutes || ' minutes')::interval < CURRENT_TIMESTAMP
+    `
+
+	result, err := r.db.ExecContext(ctx, query)
+	if err != nil {
+		return errors.Wrap(err, "failed to cleanup expired sessions")
+	}
+
+	if rowsAffected, err := result.RowsAffected(); err == nil {
+		log.Printf("Cleaned up %d expired sessions", rowsAffected)
+	}
+
+	return nil
 }
 
 func NewPostgresRepository(db *sql.DB) repository.SessionRepository {
