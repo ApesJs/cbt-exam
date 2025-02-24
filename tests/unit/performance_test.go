@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -18,62 +20,562 @@ import (
 	sessionv1 "github.com/ApesJs/cbt-exam/api/proto/session/v1"
 )
 
-// TestConfig berisi konfigurasi untuk pengujian performa
-type TestConfig struct {
-	ExamServiceAddr     string
-	QuestionServiceAddr string
-	SessionServiceAddr  string
-	ScoringServiceAddr  string
-	ConcurrentUsers     int
-	RequestsPerUser     int
+// ResponseTimeMetrics menyimpan metrik response time untuk tiap API
+type ResponseTimeMetrics struct {
+	Name        string
+	Count       int
+	Total       time.Duration
+	Min         time.Duration
+	Max         time.Duration
+	Average     time.Duration
+	Percentiles map[int]time.Duration // p50, p90, p95, p99
+	Samples     []time.Duration       // untuk menghitung persentil
 }
 
-// PerformanceResult menyimpan hasil pengujian performa
-type PerformanceResult struct {
-	TotalRequests      int
-	SuccessfulRequests int
-	FailedRequests     int
-	TotalDuration      time.Duration
-	AverageLatency     time.Duration
-	MinLatency         time.Duration
-	MaxLatency         time.Duration
-	RequestsPerSecond  float64
-}
-
-func waitForServices(t *testing.T, config TestConfig) error {
-	services := []struct {
-		name string
-		addr string
-	}{
-		{"exam", config.ExamServiceAddr},
-		{"question", config.QuestionServiceAddr},
-		{"session", config.SessionServiceAddr},
-		{"scoring", config.ScoringServiceAddr},
+// TestResponseTimeWithExistingData menguji response time untuk setiap API utama menggunakan data yang sudah ada
+func TestResponseTimeWithExistingData(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping response time test in short mode")
 	}
 
-	timeout := time.After(30 * time.Second)
-	tick := time.Tick(500 * time.Millisecond)
+	// Konfigurasi test
+	config := struct {
+		ExamServiceAddr     string
+		QuestionServiceAddr string
+		SessionServiceAddr  string
+		ScoringServiceAddr  string
+		NumRequests         int
+		Concurrency         int
+		ExistingExamID      string // Menggunakan ID ujian yang sudah ada
+	}{
+		ExamServiceAddr:     "localhost:50051",
+		QuestionServiceAddr: "localhost:50052",
+		SessionServiceAddr:  "localhost:50053",
+		ScoringServiceAddr:  "localhost:50054",
+		NumRequests:         100,                                    // Jumlah request per API
+		Concurrency:         10,                                     // Jumlah concurrent request
+		ExistingExamID:      "33333333-3333-3333-3333-333333333333", // ID ujian yang sudah ada di database
+	}
 
-	for _, svc := range services {
-		for {
-			select {
-			case <-timeout:
-				return fmt.Errorf("timeout waiting for %s service", svc.name)
-			case <-tick:
-				conn, err := grpc.Dial(svc.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-				if err == nil {
-					conn.Close()
-					t.Logf("%s service is ready", svc.name)
-					break
-				}
-			}
+	// Buat koneksi ke service
+	examClient, questionClient, sessionClient, scoringClient, connections, err := createServiceClients(config.ExamServiceAddr,
+		config.QuestionServiceAddr, config.SessionServiceAddr, config.ScoringServiceAddr)
+	if err != nil {
+		t.Fatalf("Failed to create service clients: %v", err)
+	}
+	defer func() {
+		for _, conn := range connections {
+			conn.Close()
+		}
+	}()
+
+	// Verifikasi bahwa ujian yang digunakan sudah aktif
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	exam, err := examClient.GetExam(ctx, &examv1.GetExamRequest{
+		Id: config.ExistingExamID,
+	})
+	if err != nil {
+		t.Fatalf("Failed to get exam: %v", err)
+	}
+
+	if exam.Status.State != examv1.ExamState_EXAM_STATE_ACTIVE {
+		// Jika ujian tidak aktif, aktivasi dulu
+		t.Logf("Activating exam %s...", config.ExistingExamID)
+		_, err := examClient.ActivateExam(ctx, &examv1.ActivateExamRequest{
+			Id:       config.ExistingExamID,
+			ClassIds: exam.ClassIds,
+		})
+		if err != nil {
+			t.Fatalf("Failed to activate exam: %v", err)
 		}
 	}
-	return nil
+
+	// Metrik response time untuk setiap API
+	metrics := make(map[string]*ResponseTimeMetrics)
+	metrics["StartSession"] = &ResponseTimeMetrics{
+		Name:        "StartSession",
+		Percentiles: make(map[int]time.Duration),
+		Samples:     make([]time.Duration, 0, config.NumRequests),
+	}
+	metrics["GetExamQuestions"] = &ResponseTimeMetrics{
+		Name:        "GetExamQuestions",
+		Percentiles: make(map[int]time.Duration),
+		Samples:     make([]time.Duration, 0, config.NumRequests),
+	}
+	metrics["SubmitAnswer"] = &ResponseTimeMetrics{
+		Name:        "SubmitAnswer",
+		Percentiles: make(map[int]time.Duration),
+		Samples:     make([]time.Duration, 0, config.NumRequests),
+	}
+	metrics["FinishSession"] = &ResponseTimeMetrics{
+		Name:        "FinishSession",
+		Percentiles: make(map[int]time.Duration),
+		Samples:     make([]time.Duration, 0, config.NumRequests),
+	}
+	metrics["CalculateScore"] = &ResponseTimeMetrics{
+		Name:        "CalculateScore",
+		Percentiles: make(map[int]time.Duration),
+		Samples:     make([]time.Duration, 0, config.NumRequests),
+	}
+
+	// Test StartSession API
+	t.Log("Testing StartSession API response time...")
+	testStartSessionResponseTime(t, sessionClient, config.ExistingExamID, config.NumRequests, config.Concurrency, metrics["StartSession"])
+
+	// Test GetExamQuestions API
+	t.Log("Testing GetExamQuestions API response time...")
+	testGetExamQuestionsResponseTime(t, questionClient, config.ExistingExamID, config.NumRequests, config.Concurrency, metrics["GetExamQuestions"])
+
+	// Untuk SubmitAnswer, FinishSession, dan CalculateScore, perlu dibuat sesi terlebih dahulu
+	t.Log("Creating sessions for answer submission tests...")
+	sessionIDs := createTestSessions(t, sessionClient, config.ExistingExamID, config.NumRequests)
+
+	// Test SubmitAnswer API
+	t.Log("Testing SubmitAnswer API response time...")
+	testSubmitAnswerResponseTime(t, sessionClient, questionClient, sessionIDs, config.ExistingExamID, config.NumRequests, config.Concurrency, metrics["SubmitAnswer"])
+
+	// Test FinishSession API
+	t.Log("Testing FinishSession API response time...")
+	testFinishSessionResponseTime(t, sessionClient, sessionIDs, config.NumRequests, config.Concurrency, metrics["FinishSession"])
+
+	// Test CalculateScore API
+	t.Log("Testing CalculateScore API response time...")
+	testCalculateScoreResponseTime(t, scoringClient, sessionIDs, config.NumRequests, config.Concurrency, metrics["CalculateScore"])
+
+	// Tampilkan hasil dan validasi
+	t.Log("\nResponse Time Test Results:")
+	for _, m := range metrics {
+		// Hitung persentil
+		calculatePercentiles(m)
+
+		t.Logf("API: %s", m.Name)
+		t.Logf("  Total Requests:    %d", m.Count)
+		t.Logf("  Min Response Time: %v", m.Min)
+		t.Logf("  Max Response Time: %v", m.Max)
+		t.Logf("  Avg Response Time: %v", m.Average)
+		t.Logf("  P50 Response Time: %v", m.Percentiles[50])
+		t.Logf("  P90 Response Time: %v", m.Percentiles[90])
+		t.Logf("  P95 Response Time: %v", m.Percentiles[95])
+		t.Logf("  P99 Response Time: %v", m.Percentiles[99])
+
+		// Validasi response time terhadap SLA
+		validateResponseTime(t, m)
+	}
+}
+
+// Menghitung persentil dari sampel response time
+func calculatePercentiles(metrics *ResponseTimeMetrics) {
+	if len(metrics.Samples) == 0 {
+		return
+	}
+
+	// Sort samples
+	sort.Slice(metrics.Samples, func(i, j int) bool {
+		return metrics.Samples[i] < metrics.Samples[j]
+	})
+
+	// Find min and max
+	metrics.Min = metrics.Samples[0]
+	metrics.Max = metrics.Samples[len(metrics.Samples)-1]
+
+	// Calculate percentiles
+	getPercentile := func(percent int) time.Duration {
+		idx := int(float64(percent) / 100.0 * float64(len(metrics.Samples)-1))
+		return metrics.Samples[idx]
+	}
+
+	metrics.Percentiles[50] = getPercentile(50)
+	metrics.Percentiles[90] = getPercentile(90)
+	metrics.Percentiles[95] = getPercentile(95)
+	metrics.Percentiles[99] = getPercentile(99)
+}
+
+// Validasi response time terhadap SLA
+func validateResponseTime(t *testing.T, metrics *ResponseTimeMetrics) {
+	// Definisi SLA berdasarkan API
+	slaLimits := map[string]time.Duration{
+		"StartSession":     100 * time.Millisecond,
+		"GetExamQuestions": 150 * time.Millisecond,
+		"SubmitAnswer":     50 * time.Millisecond,
+		"FinishSession":    100 * time.Millisecond,
+		"CalculateScore":   200 * time.Millisecond,
+	}
+
+	// Validasi P95 response time
+	slaLimit, exists := slaLimits[metrics.Name]
+	if exists {
+		assert.LessOrEqual(t, metrics.Percentiles[95], slaLimit,
+			"P95 response time for %s exceeds SLA limit of %v", metrics.Name, slaLimit)
+	}
+}
+
+// Test StartSession API response time
+func testStartSessionResponseTime(t *testing.T, sessionClient sessionv1.SessionServiceClient, examID string, numRequests, concurrency int, metrics *ResponseTimeMetrics) {
+	var wg sync.WaitGroup
+	var mutex sync.Mutex
+
+	// Channel untuk throttling concurrency
+	semaphore := make(chan struct{}, concurrency)
+
+	for i := 0; i < numRequests; i++ {
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire
+
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release
+
+			// Generate UUID untuk student ID (harus dalam format UUID)
+			studentID := uuid.New().String()
+
+			// Measure response time
+			start := time.Now()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, err := sessionClient.StartSession(ctx, &sessionv1.StartSessionRequest{
+				ExamId:    examID,
+				StudentId: studentID,
+			})
+
+			duration := time.Since(start)
+
+			// Record metrics
+			mutex.Lock()
+			if err == nil {
+				metrics.Count++
+				metrics.Total += duration
+				metrics.Samples = append(metrics.Samples, duration)
+			} else {
+				t.Logf("Error starting session %d: %v", idx, err)
+			}
+			mutex.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+	if metrics.Count > 0 {
+		metrics.Average = metrics.Total / time.Duration(metrics.Count)
+	}
+}
+
+// Test GetExamQuestions API response time
+func testGetExamQuestionsResponseTime(t *testing.T, questionClient questionv1.QuestionServiceClient, examID string, numRequests, concurrency int, metrics *ResponseTimeMetrics) {
+	var wg sync.WaitGroup
+	var mutex sync.Mutex
+
+	// Channel untuk throttling concurrency
+	semaphore := make(chan struct{}, concurrency)
+
+	for i := 0; i < numRequests; i++ {
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire
+
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release
+
+			// Measure response time
+			start := time.Now()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, err := questionClient.GetExamQuestions(ctx, &questionv1.GetExamQuestionsRequest{
+				ExamId:    examID,
+				Randomize: true,
+				Limit:     20,
+			})
+
+			duration := time.Since(start)
+
+			// Record metrics
+			mutex.Lock()
+			if err == nil {
+				metrics.Count++
+				metrics.Total += duration
+				metrics.Samples = append(metrics.Samples, duration)
+			} else {
+				t.Logf("Error getting exam questions %d: %v", idx, err)
+			}
+			mutex.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+	if metrics.Count > 0 {
+		metrics.Average = metrics.Total / time.Duration(metrics.Count)
+	}
+}
+
+// Helper function untuk membuat sesi test
+func createTestSessions(t *testing.T, sessionClient sessionv1.SessionServiceClient, examID string, numSessions int) []string {
+	sessionIDs := make([]string, 0, numSessions)
+	var mutex sync.Mutex
+	var wg sync.WaitGroup
+
+	// Batasi jumlah goroutine yang berjalan bersamaan
+	semaphore := make(chan struct{}, 10)
+
+	for i := 0; i < numSessions; i++ {
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire
+
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release
+
+			studentID := uuid.New().String()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			resp, err := sessionClient.StartSession(ctx, &sessionv1.StartSessionRequest{
+				ExamId:    examID,
+				StudentId: studentID,
+			})
+
+			if err != nil {
+				t.Logf("Error creating test session %d: %v", idx, err)
+				return
+			}
+
+			mutex.Lock()
+			sessionIDs = append(sessionIDs, resp.Id)
+			mutex.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+	return sessionIDs
+}
+
+// Test SubmitAnswer API response time
+func testSubmitAnswerResponseTime(t *testing.T, sessionClient sessionv1.SessionServiceClient, questionClient questionv1.QuestionServiceClient,
+	sessionIDs []string, examID string, numRequests, concurrency int, metrics *ResponseTimeMetrics) {
+
+	if len(sessionIDs) == 0 {
+		t.Log("No valid sessions to test SubmitAnswer API")
+		return
+	}
+
+	// Get questions first
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	questionsResp, err := questionClient.GetExamQuestions(ctx, &questionv1.GetExamQuestionsRequest{
+		ExamId:    examID,
+		Randomize: false,
+		Limit:     20,
+	})
+	if err != nil {
+		t.Fatalf("Failed to get questions for submit answer test: %v", err)
+		return
+	}
+
+	if len(questionsResp.Questions) == 0 {
+		t.Fatalf("No questions available for submit answer test")
+		return
+	}
+
+	var wg sync.WaitGroup
+	var mutex sync.Mutex
+
+	// Channel untuk throttling concurrency
+	semaphore := make(chan struct{}, concurrency)
+
+	// Limit to the number of available sessions or requested tests
+	testCount := min(numRequests, len(sessionIDs))
+
+	for i := 0; i < testCount; i++ {
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire
+
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release
+
+			sessionID := sessionIDs[idx%len(sessionIDs)]
+			questionIdx := idx % len(questionsResp.Questions)
+			questionID := questionsResp.Questions[questionIdx].Id
+
+			// Random choice A, B, C, or D
+			choiceIdx := rand.Intn(4)
+			selectedChoice := string(rune('A' + choiceIdx))
+
+			// Measure response time
+			start := time.Now()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, err := sessionClient.SubmitAnswer(ctx, &sessionv1.SubmitAnswerRequest{
+				SessionId:      sessionID,
+				QuestionId:     questionID,
+				SelectedChoice: selectedChoice,
+			})
+
+			duration := time.Since(start)
+
+			// Record metrics
+			mutex.Lock()
+			if err == nil {
+				metrics.Count++
+				metrics.Total += duration
+				metrics.Samples = append(metrics.Samples, duration)
+			} else {
+				t.Logf("Error submitting answer %d: %v", idx, err)
+			}
+			mutex.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+	if metrics.Count > 0 {
+		metrics.Average = metrics.Total / time.Duration(metrics.Count)
+	}
+}
+
+// Test FinishSession API response time
+func testFinishSessionResponseTime(t *testing.T, sessionClient sessionv1.SessionServiceClient, sessionIDs []string, numRequests, concurrency int, metrics *ResponseTimeMetrics) {
+	if len(sessionIDs) == 0 {
+		t.Log("No valid sessions to test FinishSession API")
+		return
+	}
+
+	var wg sync.WaitGroup
+	var mutex sync.Mutex
+
+	// Channel untuk throttling concurrency
+	semaphore := make(chan struct{}, concurrency)
+
+	// Use only half of the sessions for finish test (we'll need some for calculate score)
+	finishCount := min(numRequests, len(sessionIDs)/2)
+	if finishCount == 0 {
+		t.Log("Not enough sessions to test FinishSession API")
+		return
+	}
+
+	finishSessionIDs := sessionIDs[:finishCount]
+
+	for i := 0; i < len(finishSessionIDs); i++ {
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire
+
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release
+
+			sessionID := finishSessionIDs[idx]
+
+			// Measure response time
+			start := time.Now()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, err := sessionClient.FinishSession(ctx, &sessionv1.FinishSessionRequest{
+				Id: sessionID,
+			})
+
+			duration := time.Since(start)
+
+			// Record metrics
+			mutex.Lock()
+			if err == nil {
+				metrics.Count++
+				metrics.Total += duration
+				metrics.Samples = append(metrics.Samples, duration)
+			} else {
+				t.Logf("Error finishing session %d: %v", idx, err)
+			}
+			mutex.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+	if metrics.Count > 0 {
+		metrics.Average = metrics.Total / time.Duration(metrics.Count)
+	}
+}
+
+// Test CalculateScore API response time
+func testCalculateScoreResponseTime(t *testing.T, scoringClient scoringv1.ScoringServiceClient, sessionIDs []string, numRequests, concurrency int, metrics *ResponseTimeMetrics) {
+	if len(sessionIDs) == 0 {
+		t.Log("No valid sessions to test CalculateScore API")
+		return
+	}
+
+	var wg sync.WaitGroup
+	var mutex sync.Mutex
+
+	// Channel untuk throttling concurrency
+	semaphore := make(chan struct{}, concurrency)
+
+	// Use the remaining half of sessions for calculate score
+	calculateCount := min(numRequests, len(sessionIDs)/2)
+	startIdx := len(sessionIDs) - calculateCount
+	if startIdx < 0 || calculateCount == 0 {
+		t.Log("Not enough sessions to test CalculateScore API")
+		return
+	}
+
+	calculateSessionIDs := sessionIDs[startIdx:]
+
+	for i := 0; i < len(calculateSessionIDs); i++ {
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire
+
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release
+
+			sessionID := calculateSessionIDs[idx]
+
+			// Measure response time
+			start := time.Now()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			_, err := scoringClient.CalculateScore(ctx, &scoringv1.CalculateScoreRequest{
+				SessionId: sessionID,
+			})
+
+			duration := time.Since(start)
+
+			// Record metrics
+			mutex.Lock()
+			if err == nil {
+				metrics.Count++
+				metrics.Total += duration
+				metrics.Samples = append(metrics.Samples, duration)
+			} else {
+				t.Logf("Error calculating score %d: %v", idx, err)
+			}
+			mutex.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+	if metrics.Count > 0 {
+		metrics.Average = metrics.Total / time.Duration(metrics.Count)
+	}
+}
+
+// Helper untuk menentukan nilai minimum dari dua int
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // createServiceClients membuat koneksi ke semua service
-func createServiceClients(config TestConfig) (
+func createServiceClients(examAddr, questionAddr, sessionAddr, scoringAddr string) (
 	examv1.ExamServiceClient,
 	questionv1.QuestionServiceClient,
 	sessionv1.SessionServiceClient,
@@ -82,20 +584,20 @@ func createServiceClients(config TestConfig) (
 	error) {
 
 	// Buat koneksi ke ExamService
-	examConn, err := grpc.Dial(config.ExamServiceAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	examConn, err := grpc.Dial(examAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, nil, nil, nil, nil, fmt.Errorf("failed to connect to exam service: %v", err)
 	}
 
 	// Buat koneksi ke QuestionService
-	questionConn, err := grpc.Dial(config.QuestionServiceAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	questionConn, err := grpc.Dial(questionAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		examConn.Close()
 		return nil, nil, nil, nil, nil, fmt.Errorf("failed to connect to question service: %v", err)
 	}
 
 	// Buat koneksi ke SessionService
-	sessionConn, err := grpc.Dial(config.SessionServiceAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	sessionConn, err := grpc.Dial(sessionAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		examConn.Close()
 		questionConn.Close()
@@ -103,7 +605,7 @@ func createServiceClients(config TestConfig) (
 	}
 
 	// Buat koneksi ke ScoringService
-	scoringConn, err := grpc.Dial(config.ScoringServiceAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	scoringConn, err := grpc.Dial(scoringAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		examConn.Close()
 		questionConn.Close()
@@ -120,380 +622,4 @@ func createServiceClients(config TestConfig) (
 	connections := []*grpc.ClientConn{examConn, questionConn, sessionConn, scoringConn}
 
 	return examClient, questionClient, sessionClient, scoringClient, connections, nil
-}
-
-// closeConnections menutup semua koneksi gRPC
-func closeConnections(connections []*grpc.ClientConn) {
-	for _, conn := range connections {
-		conn.Close()
-	}
-}
-
-// TestExamSessionPerformance menguji performa saat banyak siswa mengakses ujian secara bersamaan
-func TestExamSessionPerformance(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping performance test in short mode")
-	}
-
-	// Konfigurasi test
-	config := TestConfig{
-		ExamServiceAddr:     "localhost:50051",
-		QuestionServiceAddr: "localhost:50052",
-		SessionServiceAddr:  "localhost:50053",
-		ScoringServiceAddr:  "localhost:50054",
-		ConcurrentUsers:     100,
-		RequestsPerUser:     10,
-	}
-
-	// Tunggu semua service siap
-	if err := waitForServices(t, config); err != nil {
-		t.Fatalf("Failed waiting for services: %v", err)
-	}
-
-	// Buat koneksi ke service
-	examClient, questionClient, sessionClient, scoringClient, connections, err := createServiceClients(config)
-	if err != nil {
-		t.Fatalf("Failed to create service clients: %v", err)
-	}
-	defer closeConnections(connections)
-
-	// Persiapkan ujian untuk testing
-	t.Log("Preparing exam...")
-	examID, err := prepareExam(t, examClient, questionClient)
-	if err != nil {
-		t.Fatalf("Failed to prepare exam: %v", err)
-	}
-
-	// Aktifkan ujian
-	t.Log("Activating exam...")
-	_, err = examClient.ActivateExam(context.Background(), &examv1.ActivateExamRequest{
-		Id:       examID,
-		ClassIds: []string{"class-1"},
-	})
-	if err != nil {
-		t.Fatalf("Failed to activate exam: %v", err)
-	}
-
-	// Channel untuk mengumpulkan hasil
-	resultChan := make(chan time.Duration, config.ConcurrentUsers*config.RequestsPerUser)
-	errorChan := make(chan error, config.ConcurrentUsers*config.RequestsPerUser)
-
-	var wg sync.WaitGroup
-	startTime := time.Now()
-
-	// Jalankan test performa
-	t.Logf("Starting performance test with %d concurrent users...", config.ConcurrentUsers)
-	for i := 0; i < config.ConcurrentUsers; i++ {
-		wg.Add(1)
-		go func(studentID int) {
-			defer wg.Done()
-
-			// Mulai sesi ujian
-			sessionID, err := startExamSession(
-				context.Background(),
-				sessionClient,
-				examID,
-				fmt.Sprintf("student-%d", studentID),
-			)
-			if err != nil {
-				errorChan <- fmt.Errorf("student %d failed to start session: %v", studentID, err)
-				return
-			}
-
-			// Ambil soal ujian
-			questions, err := getExamQuestions(context.Background(), questionClient, examID)
-			if err != nil {
-				errorChan <- fmt.Errorf("student %d failed to get questions: %v", studentID, err)
-				return
-			}
-
-			// Simulasi menjawab soal
-			for j := 0; j < config.RequestsPerUser; j++ {
-				start := time.Now()
-
-				// Pilih jawaban random
-				questionIdx := j % len(questions)
-				choiceIdx := rand.Intn(len(questions[questionIdx].Choices))
-				selectedChoice := string(rune('A' + choiceIdx))
-
-				// Submit jawaban
-				_, err := sessionClient.SubmitAnswer(context.Background(), &sessionv1.SubmitAnswerRequest{
-					SessionId:      sessionID,
-					QuestionId:     questions[questionIdx].Id,
-					SelectedChoice: selectedChoice,
-				})
-
-				latency := time.Since(start)
-				resultChan <- latency
-
-				if err != nil {
-					errorChan <- fmt.Errorf("student %d failed to submit answer: %v", studentID, err)
-				}
-
-				// Simulasi waktu berpikir siswa
-				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
-			}
-
-			// Selesaikan ujian
-			_, err = sessionClient.FinishSession(context.Background(), &sessionv1.FinishSessionRequest{
-				Id: sessionID,
-			})
-			if err != nil {
-				errorChan <- fmt.Errorf("student %d failed to finish session: %v", studentID, err)
-			}
-
-			// Hitung skor
-			_, err = scoringClient.CalculateScore(context.Background(), &scoringv1.CalculateScoreRequest{
-				SessionId: sessionID,
-			})
-			if err != nil {
-				errorChan <- fmt.Errorf("student %d failed to calculate score: %v", studentID, err)
-			}
-		}(i)
-	}
-
-	// Tunggu semua selesai
-	wg.Wait()
-	totalDuration := time.Since(startTime)
-	close(resultChan)
-	close(errorChan)
-
-	// Hitung statistik
-	var totalLatency time.Duration
-	var maxLatency time.Duration
-	minLatency := time.Hour
-	successCount := 0
-	errorCount := 0
-
-	for latency := range resultChan {
-		successCount++
-		totalLatency += latency
-		if latency > maxLatency {
-			maxLatency = latency
-		}
-		if latency < minLatency {
-			minLatency = latency
-		}
-	}
-
-	for range errorChan {
-		errorCount++
-	}
-
-	avgLatency := totalLatency / time.Duration(successCount)
-	rps := float64(successCount) / totalDuration.Seconds()
-
-	// Tampilkan hasil
-	t.Logf("\nPerformance Test Results:")
-	t.Logf("  Total Requests:       %d", successCount+errorCount)
-	t.Logf("  Successful Requests:  %d", successCount)
-	t.Logf("  Failed Requests:      %d", errorCount)
-	t.Logf("  Total Duration:       %v", totalDuration)
-	t.Logf("  Average Latency:      %v", avgLatency)
-	t.Logf("  Min Latency:          %v", minLatency)
-	t.Logf("  Max Latency:          %v", maxLatency)
-	t.Logf("  Requests Per Second:  %.2f", rps)
-
-	// Assertions
-	assert.Less(t, float64(errorCount)/float64(successCount+errorCount)*100, 5.0,
-		"Error rate should be less than 5%")
-	assert.Less(t, avgLatency, 200*time.Millisecond,
-		"Average latency should be less than 200ms")
-	assert.GreaterOrEqual(t, rps, 50.0,
-		"Should handle at least 50 requests per second")
-}
-
-// TestConcurrentExamSessions menguji kemampuan sistem menangani banyak sesi ujian secara bersamaan
-func TestConcurrentExamSessions(t *testing.T) {
-	// Skip test jika running di CI environment atau dengan -short flag
-	if testing.Short() {
-		t.Skip("Skipping performance test in short mode")
-	}
-
-	// Konfigurasi pengujian
-	config := TestConfig{
-		ExamServiceAddr:     "localhost:50051",
-		QuestionServiceAddr: "localhost:50052",
-		SessionServiceAddr:  "localhost:50053",
-		ScoringServiceAddr:  "localhost:50054",
-		ConcurrentUsers:     1000, // Simulasikan 1000 siswa secara bersamaan
-		RequestsPerUser:     1,    // Setiap siswa memulai 1 sesi
-	}
-
-	// Buat koneksi ke service
-	examClient, questionClient, sessionClient, _, connections, err := createServiceClients(config)
-	if err != nil {
-		t.Fatalf("Failed to create service clients: %v", err)
-	}
-	defer closeConnections(connections)
-
-	// Persiapkan ujian untuk testing
-	examID, err := prepareExam(t, examClient, questionClient)
-	if err != nil {
-		t.Fatalf("Failed to prepare exam: %v", err)
-	}
-
-	// Aktifkan ujian
-	_, err = examClient.ActivateExam(context.Background(), &examv1.ActivateExamRequest{
-		Id:       examID,
-		ClassIds: []string{"class-1"},
-	})
-	if err != nil {
-		t.Fatalf("Failed to activate exam: %v", err)
-	}
-
-	// Channel untuk mengumpulkan hasil
-	sessionCreationTimes := make(chan time.Duration, config.ConcurrentUsers)
-	errorChan := make(chan error, config.ConcurrentUsers)
-
-	// Tunggu semua goroutine selesai
-	var wg sync.WaitGroup
-
-	// Catat waktu mulai
-	startTime := time.Now()
-
-	// Simulasikan banyak siswa memulai sesi ujian secara bersamaan
-	for i := 0; i < config.ConcurrentUsers; i++ {
-		wg.Add(1)
-		go func(studentID int) {
-			defer wg.Done()
-
-			// Catat waktu sebelum request
-			beforeRequest := time.Now()
-
-			// Mulai sesi ujian
-			_, err := sessionClient.StartSession(context.Background(), &sessionv1.StartSessionRequest{
-				ExamId:    examID,
-				StudentId: fmt.Sprintf("student-%d", studentID),
-			})
-
-			// Catat waktu setelah request
-			latency := time.Since(beforeRequest)
-			sessionCreationTimes <- latency
-
-			if err != nil {
-				errorChan <- err
-			}
-		}(i)
-	}
-
-	// Tunggu semua goroutine selesai
-	wg.Wait()
-	close(sessionCreationTimes)
-	close(errorChan)
-
-	// Hitung total durasi pengujian
-	totalDuration := time.Since(startTime)
-
-	// Aggregate results
-	var successCount, errorCount int
-	var totalLatency, minLatency, maxLatency time.Duration
-
-	// Set minLatency ke nilai maksimum awal
-	minLatency = time.Hour
-
-	for latency := range sessionCreationTimes {
-		successCount++
-		totalLatency += latency
-
-		if latency < minLatency {
-			minLatency = latency
-		}
-		if latency > maxLatency {
-			maxLatency = latency
-		}
-	}
-
-	// Hitung jumlah error
-	for range errorChan {
-		errorCount++
-	}
-
-	// Hitung metrik
-	totalRequests := successCount + errorCount
-	averageLatency := totalLatency / time.Duration(successCount)
-	requestsPerSecond := float64(successCount) / totalDuration.Seconds()
-
-	// Tampilkan hasil
-	t.Logf("Concurrent Sessions Test Results:")
-	t.Logf("  Total Session Requests:       %d", totalRequests)
-	t.Logf("  Successful Sessions Started:  %d", successCount)
-	t.Logf("  Failed Session Requests:      %d", errorCount)
-	t.Logf("  Total Duration:               %v", totalDuration)
-	t.Logf("  Average Session Creation Time: %v", averageLatency)
-	t.Logf("  Min Session Creation Time:     %v", minLatency)
-	t.Logf("  Max Session Creation Time:     %v", maxLatency)
-	t.Logf("  Sessions Started Per Second:   %.2f", requestsPerSecond)
-
-	// Assertions untuk memastikan performa memenuhi ekspektasi
-	successRate := float64(successCount) / float64(totalRequests) * 100
-	assert.GreaterOrEqual(t, successRate, 95.0, "Session creation success rate should be at least 95%%")
-	assert.LessOrEqual(t, averageLatency, 200*time.Millisecond, "Average session creation time should be less than 200ms")
-	assert.GreaterOrEqual(t, requestsPerSecond, 50.0, "Should handle at least 50 session creations per second")
-}
-
-// Helper function untuk mempersiapkan ujian
-func prepareExam(t *testing.T, examClient examv1.ExamServiceClient, questionClient questionv1.QuestionServiceClient) (string, error) {
-	// Buat ujian
-	examResp, err := examClient.CreateExam(context.Background(), &examv1.CreateExamRequest{
-		Title:           "Performance Test Exam",
-		Subject:         "Performance Testing",
-		DurationMinutes: 60,
-		TotalQuestions:  20,
-		IsRandom:        true,
-		TeacherId:       "teacher-performance-test",
-		ClassIds:        []string{"class-1"},
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to create exam: %v", err)
-	}
-
-	examID := examResp.Id
-
-	// Buat pertanyaan untuk ujian
-	for i := 0; i < 20; i++ {
-		choices := []*questionv1.Choice{
-			{Text: "Pilihan A"},
-			{Text: "Pilihan B"},
-			{Text: "Pilihan C"},
-			{Text: "Pilihan D"},
-		}
-
-		_, err := questionClient.CreateQuestion(context.Background(), &questionv1.CreateQuestionRequest{
-			ExamId:        examID,
-			QuestionText:  fmt.Sprintf("Pertanyaan performance test %d?", i+1),
-			CorrectAnswer: "A", // Untuk simplifikasi, jawaban benar selalu A
-			Choices:       choices,
-		})
-		if err != nil {
-			return "", fmt.Errorf("failed to create question %d: %v", i+1, err)
-		}
-	}
-
-	return examID, nil
-}
-
-// Helper function untuk memulai sesi ujian
-func startExamSession(ctx context.Context, sessionClient sessionv1.SessionServiceClient, examID, studentID string) (string, error) {
-	resp, err := sessionClient.StartSession(ctx, &sessionv1.StartSessionRequest{
-		ExamId:    examID,
-		StudentId: studentID,
-	})
-	if err != nil {
-		return "", err
-	}
-	return resp.Id, nil
-}
-
-// Helper function untuk mendapatkan pertanyaan ujian
-func getExamQuestions(ctx context.Context, questionClient questionv1.QuestionServiceClient, examID string) ([]*questionv1.Question, error) {
-	resp, err := questionClient.GetExamQuestions(ctx, &questionv1.GetExamQuestionsRequest{
-		ExamId:    examID,
-		Randomize: true,
-		Limit:     20,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return resp.Questions, nil
 }
