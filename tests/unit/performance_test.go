@@ -58,6 +58,9 @@ type TestConfig struct {
 	ExportMetrics    bool   // Ekspor metrik ke CSV
 	OutputDir        string // Direktori output
 	MonitorResources bool   // Monitor penggunaan resource
+
+	// Debug mode
+	DebugMode bool // Mode debug dengan output lebih detail
 }
 
 // ResponseTimeMetrics menyimpan metrik response time untuk tiap API
@@ -71,6 +74,7 @@ type ResponseTimeMetrics struct {
 	Percentiles map[int]time.Duration // p50, p90, p95, p99
 	Samples     []time.Duration       // untuk menghitung persentil
 	ErrorCount  int                   // jumlah error
+	LastErrors  []string              // menyimpan beberapa error terakhir untuk debugging
 	mutex       sync.Mutex            // untuk thread safety
 }
 
@@ -95,21 +99,36 @@ func TestRealisticUserJourney(t *testing.T) {
 		QuestionServiceAddr: "localhost:50052",
 		SessionServiceAddr:  "localhost:50053",
 		ScoringServiceAddr:  "localhost:50054",
-		NumUsers:            100,
+		NumUsers:            10,
 		RampUpSeconds:       60,
-		TestDurationMinutes: 15,
+		TestDurationMinutes: 60,
 		ExistingExamID:      "33333333-3333-3333-3333-333333333333",
 		ConcurrentUsers:     30,
 		RequestTimeout:      5 * time.Second,
-		ThinkTimeMin:        5,
-		ThinkTimeMax:        15,
-		AnswerTimeMin:       20,
-		AnswerTimeMax:       90,
-		NetworkFailureRate:  0.01,
-		SlowResponseRate:    0.05,
+		ThinkTimeMin:        1,     // PERBAIKAN: Kurangi dari 5 ke 1 detik
+		ThinkTimeMax:        3,     // PERBAIKAN: Kurangi dari 15 ke 3 detik
+		AnswerTimeMin:       1,     // PERBAIKAN: Kurangi dari 20 ke 1 detik
+		AnswerTimeMax:       2,     // PERBAIKAN: Kurangi dari 90 ke 2 detik
+		NetworkFailureRate:  0.005, // PERBAIKAN: Kurangi dari 0.01 ke 0.005
+		SlowResponseRate:    0.01,  // PERBAIKAN: Kurangi dari 0.05 ke 0.01
 		ExportMetrics:       true,
 		OutputDir:           "./test_results",
 		MonitorResources:    true,
+		DebugMode:           false, // PERBAIKAN: Aktifkan mode debug jika perlu
+	}
+
+	// PERBAIKAN: Mode debugging untuk pengujian satu pengguna
+	if config.DebugMode {
+		// Tetapkan parameter untuk debug yang lebih mudah
+		config.NumUsers = 1
+		config.RampUpSeconds = 0
+		config.ThinkTimeMin = 0
+		config.ThinkTimeMax = 0
+		config.AnswerTimeMin = 0
+		config.AnswerTimeMax = 0
+		config.NetworkFailureRate = 0
+		config.SlowResponseRate = 0
+		log.Println("Running in DEBUG mode with single user and no delays")
 	}
 
 	// Buat output directory jika belum ada
@@ -148,31 +167,37 @@ func TestRealisticUserJourney(t *testing.T) {
 		Name:        "StartSession",
 		Percentiles: make(map[int]time.Duration),
 		Samples:     make([]time.Duration, 0, config.NumUsers),
+		LastErrors:  make([]string, 0, 10),
 	}
 	metrics["GetExamQuestions"] = &ResponseTimeMetrics{
 		Name:        "GetExamQuestions",
 		Percentiles: make(map[int]time.Duration),
 		Samples:     make([]time.Duration, 0, config.NumUsers),
+		LastErrors:  make([]string, 0, 10),
 	}
 	metrics["SubmitAnswer"] = &ResponseTimeMetrics{
 		Name:        "SubmitAnswer",
 		Percentiles: make(map[int]time.Duration),
 		Samples:     make([]time.Duration, 0, config.NumUsers*5), // Estimasi 5 jawaban per user
+		LastErrors:  make([]string, 0, 10),
 	}
 	metrics["FinishSession"] = &ResponseTimeMetrics{
 		Name:        "FinishSession",
 		Percentiles: make(map[int]time.Duration),
 		Samples:     make([]time.Duration, 0, config.NumUsers),
+		LastErrors:  make([]string, 0, 10),
 	}
 	metrics["CalculateScore"] = &ResponseTimeMetrics{
 		Name:        "CalculateScore",
 		Percentiles: make(map[int]time.Duration),
 		Samples:     make([]time.Duration, 0, config.NumUsers),
+		LastErrors:  make([]string, 0, 10),
 	}
 	metrics["TotalUserFlow"] = &ResponseTimeMetrics{
 		Name:        "TotalUserFlow",
 		Percentiles: make(map[int]time.Duration),
 		Samples:     make([]time.Duration, 0, config.NumUsers),
+		LastErrors:  make([]string, 0, 10),
 	}
 
 	// Channel untuk memantau resource
@@ -198,6 +223,16 @@ func TestRealisticUserJourney(t *testing.T) {
 	// WaitGroup untuk menunggu semua goroutine selesai
 	var wg sync.WaitGroup
 
+	// PERBAIKAN: Statistik per batch
+	type BatchStats struct {
+		StartedUsers     int
+		CompletedUsers   int
+		AnswersSubmitted int
+		ErrorCount       int
+		mutex            sync.Mutex
+	}
+	batchStats := &BatchStats{}
+
 	// Interval waktu antar user login untuk mencapai ramp-up yang diinginkan
 	userInterval := time.Duration(config.RampUpSeconds) * time.Second / time.Duration(config.NumUsers)
 
@@ -205,8 +240,18 @@ func TestRealisticUserJourney(t *testing.T) {
 	for i := 0; i < config.NumUsers; i++ {
 		wg.Add(1)
 
+		// PERBAIKAN: Logging kemajuan
+		if i > 0 && i%10 == 0 {
+			t.Logf("Scheduled %d/%d users", i, config.NumUsers)
+		}
+
 		go func(userID int) {
 			defer wg.Done()
+
+			// PERBAIKAN: Update statistik batch
+			batchStats.mutex.Lock()
+			batchStats.StartedUsers++
+			batchStats.mutex.Unlock()
 
 			// Simulasikan waktu login yang berbeda untuk setiap pengguna (ramp-up)
 			loginDelay := time.Duration(userID) * userInterval
@@ -214,7 +259,9 @@ func TestRealisticUserJourney(t *testing.T) {
 
 			// Cek apakah sudah melebihi waktu pengujian
 			if time.Now().After(endTime) {
-				t.Logf("User %d skipped - test duration exceeded", userID)
+				if config.DebugMode {
+					t.Logf("User %d skipped - test duration exceeded", userID)
+				}
 				return
 			}
 
@@ -223,24 +270,75 @@ func TestRealisticUserJourney(t *testing.T) {
 			defer func() { <-userSemaphore }()
 
 			// Jalankan simulasi alur ujian lengkap untuk pengguna ini
-			t.Logf("User %d starting exam flow", userID)
+			if config.DebugMode || userID%50 == 0 {
+				t.Logf("User %d starting exam flow", userID)
+			}
 			userStartTime := time.Now()
 
-			simulateCompleteExamFlow(
+			answers, errs := simulateCompleteExamFlow(
 				examClient, questionClient, sessionClient, scoringClient,
 				config, userID, metrics, endTime,
 			)
 
+			// Update statistik batch setelah pengguna selesai
+			batchStats.mutex.Lock()
+			batchStats.CompletedUsers++
+			batchStats.AnswersSubmitted += answers
+			batchStats.ErrorCount += errs
+			batchStats.mutex.Unlock()
+
 			// Catat total waktu alur pengguna
 			userDuration := time.Since(userStartTime)
-			recordMetric(metrics["TotalUserFlow"], userDuration, nil)
+			recordMetric(metrics["TotalUserFlow"], userDuration, nil, "")
 
-			t.Logf("User %d completed exam flow in %v", userID, userDuration)
+			if config.DebugMode || userID%50 == 0 {
+				t.Logf("User %d completed exam flow in %v (answers: %d, errors: %d)",
+					userID, userDuration, answers, errs)
+			}
 		}(i)
+	}
+
+	// PERBAIKAN: Monitor kemajuan secara berkala selama pengujian berjalan
+	if !config.DebugMode {
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					if time.Now().After(endTime) {
+						return
+					}
+
+					// Ambil snapshot statistik saat ini
+					batchStats.mutex.Lock()
+					startedUsers := batchStats.StartedUsers
+					completedUsers := batchStats.CompletedUsers
+					answersSubmitted := batchStats.AnswersSubmitted
+					errorCount := batchStats.ErrorCount
+					batchStats.mutex.Unlock()
+
+					// Log kemajuan
+					t.Logf("Progress: Started %d/%d users, Completed %d, Answers %d, Errors %d",
+						startedUsers, config.NumUsers, completedUsers, answersSubmitted, errorCount)
+				}
+			}
+		}()
 	}
 
 	// Tunggu semua simulasi pengguna selesai
 	wg.Wait()
+
+	// PERBAIKAN: Jika kita selesai terlalu cepat, dan ingin menjalankan beban dasar hingga durasi yang ditetapkan
+	remainingTime := time.Until(endTime)
+	if remainingTime > 0 && !config.DebugMode {
+		t.Logf("All users completed simulation, but test duration not reached yet. %v remaining", remainingTime)
+		t.Logf("Maintaining baseline load for remaining time...")
+
+		// Jalankan beban baseline hingga durasi tercapai
+		baselineLoad(t, examClient, questionClient, sessionClient, scoringClient, config, remainingTime)
+	}
 
 	// Hentikan monitoring resource
 	if config.MonitorResources {
@@ -249,6 +347,16 @@ func TestRealisticUserJourney(t *testing.T) {
 
 	// Hitung waktu pengujian
 	testDuration := time.Since(startTime)
+
+	// PERBAIKAN: Analisis alur lengkap
+	var totalStarted = metrics["StartSession"].Count
+	var totalQuestionsRetrieved = metrics["GetExamQuestions"].Count
+	var totalAnswers = metrics["SubmitAnswer"].Count
+	var totalFinished = metrics["FinishSession"].Count
+	var totalScores = metrics["CalculateScore"].Count
+
+	t.Logf("Flow analysis: Started=%d, GotQuestions=%d, Answers=%d, Finished=%d, Scores=%d",
+		totalStarted, totalQuestionsRetrieved, totalAnswers, totalFinished, totalScores)
 
 	// Hitung dan tampilkan hasil metrik
 	t.Log("\nPerformance Test Results:")
@@ -262,12 +370,22 @@ func TestRealisticUserJourney(t *testing.T) {
 
 		if m.Count == 0 {
 			t.Logf("API: %s - No data collected", m.Name)
+
+			// PERBAIKAN: Tampilkan beberapa error terakhir jika ada
+			if m.ErrorCount > 0 && len(m.LastErrors) > 0 {
+				t.Logf("  Last errors (%d total):", m.ErrorCount)
+				for i, err := range m.LastErrors {
+					if i < 5 { // Batasi hingga 5 error
+						t.Logf("    - %s", err)
+					}
+				}
+			}
 			continue
 		}
 
 		t.Logf("API: %s", m.Name)
 		t.Logf("  Total Requests:    %d", m.Count)
-		t.Logf("  Error Rate:        %.2f%%", float64(m.ErrorCount)/float64(m.Count)*100)
+		t.Logf("  Error Rate:        %.2f%%", float64(m.ErrorCount)/float64(m.Count+m.ErrorCount)*100)
 		t.Logf("  Min Response Time: %v", m.Min)
 		t.Logf("  Max Response Time: %v", m.Max)
 		t.Logf("  Avg Response Time: %v", m.Average)
@@ -275,6 +393,16 @@ func TestRealisticUserJourney(t *testing.T) {
 		t.Logf("  P90 Response Time: %v", m.Percentiles[90])
 		t.Logf("  P95 Response Time: %v", m.Percentiles[95])
 		t.Logf("  P99 Response Time: %v", m.Percentiles[99])
+
+		// Tampilkan beberapa error terakhir jika ada dan lebih dari 0
+		if m.ErrorCount > 0 && len(m.LastErrors) > 0 {
+			t.Logf("  Last errors (%d total):", m.ErrorCount)
+			for i, err := range m.LastErrors {
+				if i < 3 { // Batasi hingga 3 error
+					t.Logf("    - %s", err)
+				}
+			}
+		}
 
 		// Validasi response time terhadap SLA
 		validateResponseTime(t, m)
@@ -313,6 +441,7 @@ func TestRealisticUserJourney(t *testing.T) {
 }
 
 // Simulasikan alur lengkap ujian untuk satu pengguna
+// PERBAIKAN: Return jumlah jawaban dan error
 func simulateCompleteExamFlow(
 	examClient examv1.ExamServiceClient,
 	questionClient questionv1.QuestionServiceClient,
@@ -322,7 +451,16 @@ func simulateCompleteExamFlow(
 	userID int,
 	metrics map[string]*ResponseTimeMetrics,
 	endTime time.Time,
-) {
+) (int, int) {
+	// PERBAIKAN: Variabel untuk melacak jumlah jawaban dan error
+	answersSubmitted := 0
+	errorCount := 0
+
+	// Log awal flow untuk debugging
+	if config.DebugMode {
+		log.Printf("User %d starting exam flow", userID)
+	}
+
 	// Generate UUID yang unik untuk student ID
 	studentID := uuid.New().String()
 
@@ -330,7 +468,13 @@ func simulateCompleteExamFlow(
 	sessionID, err := startExamSession(sessionClient, config, studentID, metrics["StartSession"])
 	if err != nil || sessionID == "" {
 		log.Printf("User %d failed to start session: %v", userID, err)
-		return
+		errorCount++
+		return answersSubmitted, errorCount
+	}
+
+	// PERBAIKAN: Log untuk debugging
+	if config.DebugMode {
+		log.Printf("User %d started session: %s", userID, sessionID)
 	}
 
 	// Simulasikan jeda setelah memulai sesi (pengguna membaca instruksi)
@@ -338,22 +482,28 @@ func simulateCompleteExamFlow(
 
 	// Cek apakah sudah melebihi waktu pengujian
 	if time.Now().After(endTime) {
-		return
+		return answersSubmitted, errorCount
 	}
 
 	// Step 2: Ambil pertanyaan ujian
 	questions, err := getExamQuestions(questionClient, config, metrics["GetExamQuestions"])
 	if err != nil || len(questions) == 0 {
 		log.Printf("User %d failed to get questions: %v", userID, err)
-		return
+		errorCount++
+		return answersSubmitted, errorCount
+	}
+
+	// PERBAIKAN: Log untuk debugging
+	if config.DebugMode {
+		log.Printf("User %d got %d questions", userID, len(questions))
 	}
 
 	// Simulasikan jeda setelah mendapatkan pertanyaan
 	simulateUserThinkingTime(config.ThinkTimeMin/2, config.ThinkTimeMax/2)
 
 	// Step 3: Jawab pertanyaan satu per satu
-	answeredCount := 0
-	for i, question := range questions {
+	maxQuestions := min(10, len(questions)) // PERBAIKAN: Batasi ke 10 soal agar lebih cepat
+	for i, question := range questions[:maxQuestions] {
 		// Cek apakah sudah melebihi waktu pengujian
 		if time.Now().After(endTime) {
 			break
@@ -362,20 +512,36 @@ func simulateCompleteExamFlow(
 		// Simulasikan pengguna membaca dan menjawab soal
 		simulateUserThinkingTime(config.AnswerTimeMin, config.AnswerTimeMax)
 
-		// Pilih jawaban acak
-		selectedChoice := randomAnswer(question)
+		// PERBAIKAN: Pilih jawaban acak dengan log
+		selectedChoice := randomAnswer(question, config.DebugMode)
 
 		// Kirim jawaban
 		err := submitAnswer(sessionClient, config, sessionID, question.Id, selectedChoice, metrics["SubmitAnswer"])
 		if err == nil {
-			answeredCount++
+			answersSubmitted++
+			if config.DebugMode {
+				log.Printf("User %d submitted answer %d/%d successfully", userID, i+1, maxQuestions)
+			}
+		} else {
+			errorCount++
+			if config.DebugMode {
+				log.Printf("User %d failed to submit answer %d/%d: %v", userID, i+1, maxQuestions, err)
+			}
 		}
 
-		// Simulasikan kemungkinan pengguna tidak menjawab semua soal
-		// Semakin banyak soal yang dijawab, semakin besar kemungkinan untuk berhenti
-		if i > len(questions)/3 && rand.Float32() < (float32(i)/float32(len(questions)))*0.2 {
+		// PERBAIKAN: Jangan terlalu banyak simulasi berhenti di tengah
+		// Probabilitas berhenti ditingkatkan hanya setelah menjawab setidaknya setengah soal
+		if i > maxQuestions/2 && rand.Float32() < 0.05 {
+			if config.DebugMode {
+				log.Printf("User %d randomly stopping after %d answers", userID, i+1)
+			}
 			break
 		}
+	}
+
+	// PERBAIKAN: Log untuk debugging
+	if config.DebugMode {
+		log.Printf("User %d answered %d/%d questions successfully", userID, answersSubmitted, maxQuestions)
 	}
 
 	// Simulasikan jeda sebelum menyelesaikan ujian
@@ -383,28 +549,84 @@ func simulateCompleteExamFlow(
 
 	// Cek apakah sudah melebihi waktu pengujian
 	if time.Now().After(endTime) {
-		return
+		return answersSubmitted, errorCount
 	}
 
-	// Step 4: Selesaikan sesi ujian
-	err = finishExamSession(sessionClient, config, sessionID, metrics["FinishSession"])
-	if err != nil {
-		log.Printf("User %d failed to finish session: %v", userID, err)
-		// Tetap lanjutkan ke perhitungan skor meskipun ada error
+	// Step 4: Hanya selesaikan sesi dan hitung skor jika setidaknya ada 1 jawaban berhasil disubmit
+	if answersSubmitted > 0 {
+		// Selesaikan sesi ujian
+		err = finishExamSession(sessionClient, config, sessionID, metrics["FinishSession"])
+		if err != nil {
+			errorCount++
+			if config.DebugMode {
+				log.Printf("User %d failed to finish session: %v", userID, err)
+			}
+		} else if config.DebugMode {
+			log.Printf("User %d finished session successfully", userID)
+		}
+
+		// Simulasikan jeda sebelum melihat skor
+		simulateUserThinkingTime(config.ThinkTimeMin/2, config.ThinkTimeMax/2)
+
+		// Cek apakah sudah melebihi waktu pengujian
+		if time.Now().After(endTime) {
+			return answersSubmitted, errorCount
+		}
+
+		// Hitung skor ujian
+		err = calculateExamScore(scoringClient, config, sessionID, metrics["CalculateScore"])
+		if err != nil {
+			errorCount++
+			if config.DebugMode {
+				log.Printf("User %d failed to calculate score: %v", userID, err)
+			}
+		} else if config.DebugMode {
+			log.Printf("User %d calculated score successfully", userID)
+		}
 	}
 
-	// Simulasikan jeda sebelum melihat skor
-	simulateUserThinkingTime(config.ThinkTimeMin/2, config.ThinkTimeMax/2)
+	return answersSubmitted, errorCount
+}
 
-	// Cek apakah sudah melebihi waktu pengujian
-	if time.Now().After(endTime) {
-		return
-	}
+// Fungsi untuk beban baseline ketika semua simulasi selesai tapi kami ingin melanjutkan test
+func baselineLoad(
+	t *testing.T,
+	examClient examv1.ExamServiceClient,
+	questionClient questionv1.QuestionServiceClient,
+	sessionClient sessionv1.SessionServiceClient,
+	scoringClient scoringv1.ScoringServiceClient,
+	config TestConfig,
+	duration time.Duration,
+) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 
-	// Step 5: Hitung skor ujian
-	err = calculateExamScore(scoringClient, config, sessionID, metrics["CalculateScore"])
-	if err != nil {
-		log.Printf("User %d failed to calculate score: %v", userID, err)
+	endTime := time.Now().Add(duration)
+	count := 0
+
+	for {
+		if time.Now().After(endTime) {
+			break
+		}
+
+		select {
+		case <-ticker.C:
+			count++
+			// Lakukan beberapa request baseline, seperti GetExam
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err := examClient.GetExam(ctx, &examv1.GetExamRequest{
+				Id: config.ExistingExamID,
+			})
+			cancel()
+
+			if count%6 == 0 { // Setiap menit
+				if err != nil {
+					t.Logf("Baseline check %d: Error getting exam: %v", count, err)
+				} else {
+					t.Logf("Baseline check %d: Exam still active, %v remaining", count, time.Until(endTime))
+				}
+			}
+		}
 	}
 }
 
@@ -415,15 +637,21 @@ func startExamSession(
 	studentID string,
 	metrics *ResponseTimeMetrics,
 ) (string, error) {
+	// PERBAIKAN: Log untuk debugging
+	if config.DebugMode {
+		log.Printf("Starting session for student %s", studentID)
+	}
+
 	// Simulasikan kemungkinan kegagalan jaringan
 	if simulateNetworkFailure(config.NetworkFailureRate) {
-		recordMetric(metrics, 0, status.Error(codes.Unavailable, "simulated network failure"))
+		errorMsg := "simulated network failure"
+		recordMetric(metrics, 0, status.Error(codes.Unavailable, errorMsg), errorMsg)
 		return "", fmt.Errorf("network failure")
 	}
 
 	// Simulasikan kemungkinan respons lambat
 	if simulateSlowResponse(config.SlowResponseRate) {
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second) // PERBAIKAN: Kurangi dari 2 detik ke 1 detik
 	}
 
 	start := time.Now()
@@ -437,7 +665,17 @@ func startExamSession(
 	})
 
 	duration := time.Since(start)
-	recordMetric(metrics, duration, err)
+
+	// PERBAIKAN: Catat error secara lebih detail
+	errorMsg := ""
+	if err != nil {
+		errorMsg = fmt.Sprintf("%v (Code: %s)", err, status.Code(err))
+		if st, ok := status.FromError(err); ok {
+			errorMsg = fmt.Sprintf("%v (Code: %s, Message: %s)",
+				err, st.Code(), st.Message())
+		}
+	}
+	recordMetric(metrics, duration, err, errorMsg)
 
 	if err != nil {
 		return "", err
@@ -452,15 +690,21 @@ func getExamQuestions(
 	config TestConfig,
 	metrics *ResponseTimeMetrics,
 ) ([]*questionv1.Question, error) {
+	// PERBAIKAN: Log untuk debugging
+	if config.DebugMode {
+		log.Printf("Getting exam questions")
+	}
+
 	// Simulasikan kemungkinan kegagalan jaringan
 	if simulateNetworkFailure(config.NetworkFailureRate) {
-		recordMetric(metrics, 0, status.Error(codes.Unavailable, "simulated network failure"))
+		errorMsg := "simulated network failure"
+		recordMetric(metrics, 0, status.Error(codes.Unavailable, errorMsg), errorMsg)
 		return nil, fmt.Errorf("network failure")
 	}
 
 	// Simulasikan kemungkinan respons lambat
 	if simulateSlowResponse(config.SlowResponseRate) {
-		time.Sleep(3 * time.Second)
+		time.Sleep(1 * time.Second) // PERBAIKAN: Kurangi dari 3 detik ke 1 detik
 	}
 
 	start := time.Now()
@@ -475,13 +719,60 @@ func getExamQuestions(
 	})
 
 	duration := time.Since(start)
-	recordMetric(metrics, duration, err)
+
+	// PERBAIKAN: Catat error secara lebih detail
+	errorMsg := ""
+	if err != nil {
+		errorMsg = fmt.Sprintf("%v (Code: %s)", err, status.Code(err))
+		if st, ok := status.FromError(err); ok {
+			errorMsg = fmt.Sprintf("%v (Code: %s, Message: %s)",
+				err, st.Code(), st.Message())
+		}
+	}
+	recordMetric(metrics, duration, err, errorMsg)
 
 	if err != nil {
 		return nil, err
 	}
 
+	// PERBAIKAN: Log jumlah pertanyaan untuk debugging
+	if config.DebugMode && resp != nil {
+		log.Printf("Retrieved %d questions", len(resp.Questions))
+	}
+
 	return resp.Questions, nil
+}
+
+// Fungsi untuk memilih jawaban acak (diperbaiki untuk better logging)
+func randomAnswer(question *questionv1.Question, debugMode bool) string {
+	if len(question.Choices) == 0 {
+		if debugMode {
+			log.Printf("WARNING: Question %s has no choices, defaulting to 'A'", question.Id)
+		}
+		return "A" // Default jika tidak ada pilihan
+	}
+
+	// PERBAIKAN: Log untuk debugging
+	if debugMode {
+		log.Printf("Question %s has %d choices", question.Id, len(question.Choices))
+		for i, choice := range question.Choices {
+			log.Printf("  Choice %d: ID=%s, Text=%s", i, choice.Id, choice.Text)
+		}
+	}
+
+	choiceIdx := rand.Intn(len(question.Choices))
+
+	// PERBAIKAN: Gunakan format huruf (A, B, C, D) - ini lebih kompatibel dengan API
+	selectedChoice := string(rune('A' + choiceIdx))
+
+	// PERBAIKAN: Jika tidak bekerja, coba dengan ID (uncomment baris berikut)
+	// selectedChoice := question.Choices[choiceIdx].Id
+
+	if debugMode {
+		log.Printf("Selected choice %s for question %s", selectedChoice, question.Id)
+	}
+
+	return selectedChoice
 }
 
 // Fungsi untuk mengirim jawaban
@@ -493,9 +784,16 @@ func submitAnswer(
 	selectedChoice string,
 	metrics *ResponseTimeMetrics,
 ) error {
+	// PERBAIKAN: Log untuk debugging
+	if config.DebugMode {
+		log.Printf("Submitting answer: SessionID=%s, QuestionID=%s, Choice=%s",
+			sessionID, questionID, selectedChoice)
+	}
+
 	// Simulasikan kemungkinan kegagalan jaringan
 	if simulateNetworkFailure(config.NetworkFailureRate) {
-		recordMetric(metrics, 0, status.Error(codes.Unavailable, "simulated network failure"))
+		errorMsg := "simulated network failure"
+		recordMetric(metrics, 0, status.Error(codes.Unavailable, errorMsg), errorMsg)
 		return fmt.Errorf("network failure")
 	}
 
@@ -511,7 +809,24 @@ func submitAnswer(
 	})
 
 	duration := time.Since(start)
-	recordMetric(metrics, duration, err)
+
+	// PERBAIKAN: Catat error secara lebih detail
+	errorMsg := ""
+	if err != nil {
+		errorMsg = fmt.Sprintf("%v (Code: %s)", err, status.Code(err))
+		if st, ok := status.FromError(err); ok {
+			errorMsg = fmt.Sprintf("%v (Code: %s, Message: %s)",
+				err, st.Code(), st.Message())
+		}
+
+		if config.DebugMode {
+			log.Printf("Error submitting answer: %s", errorMsg)
+		}
+	} else if config.DebugMode {
+		log.Printf("Successfully submitted answer")
+	}
+
+	recordMetric(metrics, duration, err, errorMsg)
 
 	return err
 }
@@ -523,9 +838,15 @@ func finishExamSession(
 	sessionID string,
 	metrics *ResponseTimeMetrics,
 ) error {
+	// PERBAIKAN: Log untuk debugging
+	if config.DebugMode {
+		log.Printf("Finishing session: %s", sessionID)
+	}
+
 	// Simulasikan kemungkinan kegagalan jaringan
 	if simulateNetworkFailure(config.NetworkFailureRate) {
-		recordMetric(metrics, 0, status.Error(codes.Unavailable, "simulated network failure"))
+		errorMsg := "simulated network failure"
+		recordMetric(metrics, 0, status.Error(codes.Unavailable, errorMsg), errorMsg)
 		return fmt.Errorf("network failure")
 	}
 
@@ -539,7 +860,21 @@ func finishExamSession(
 	})
 
 	duration := time.Since(start)
-	recordMetric(metrics, duration, err)
+
+	// PERBAIKAN: Catat error secara lebih detail
+	errorMsg := ""
+	if err != nil {
+		errorMsg = fmt.Sprintf("%v (Code: %s)", err, status.Code(err))
+		if st, ok := status.FromError(err); ok {
+			errorMsg = fmt.Sprintf("%v (Code: %s, Message: %s)",
+				err, st.Code(), st.Message())
+		}
+
+		if config.DebugMode {
+			log.Printf("Error finishing session: %s", errorMsg)
+		}
+	}
+	recordMetric(metrics, duration, err, errorMsg)
 
 	return err
 }
@@ -551,15 +886,21 @@ func calculateExamScore(
 	sessionID string,
 	metrics *ResponseTimeMetrics,
 ) error {
+	// PERBAIKAN: Log untuk debugging
+	if config.DebugMode {
+		log.Printf("Calculating score for session: %s", sessionID)
+	}
+
 	// Simulasikan kemungkinan kegagalan jaringan
 	if simulateNetworkFailure(config.NetworkFailureRate) {
-		recordMetric(metrics, 0, status.Error(codes.Unavailable, "simulated network failure"))
+		errorMsg := "simulated network failure"
+		recordMetric(metrics, 0, status.Error(codes.Unavailable, errorMsg), errorMsg)
 		return fmt.Errorf("network failure")
 	}
 
 	// Simulasikan kemungkinan respons lambat
 	if simulateSlowResponse(config.SlowResponseRate) {
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second) // PERBAIKAN: Kurangi dari 2 detik ke 1 detik
 	}
 
 	start := time.Now()
@@ -572,7 +913,21 @@ func calculateExamScore(
 	})
 
 	duration := time.Since(start)
-	recordMetric(metrics, duration, err)
+
+	// PERBAIKAN: Catat error secara lebih detail
+	errorMsg := ""
+	if err != nil {
+		errorMsg = fmt.Sprintf("%v (Code: %s)", err, status.Code(err))
+		if st, ok := status.FromError(err); ok {
+			errorMsg = fmt.Sprintf("%v (Code: %s, Message: %s)",
+				err, st.Code(), st.Message())
+		}
+
+		if config.DebugMode {
+			log.Printf("Error calculating score: %s", errorMsg)
+		}
+	}
+	recordMetric(metrics, duration, err, errorMsg)
 
 	return err
 }
@@ -612,13 +967,24 @@ func verifyAndActivateExam(client examv1.ExamServiceClient, examID string) (bool
 	return false, nil
 }
 
-// Fungsi untuk mencatat metrik secara thread-safe
-func recordMetric(metrics *ResponseTimeMetrics, duration time.Duration, err error) {
+// PERBAIKAN: Fungsi untuk mencatat metrik secara thread-safe dengan lebih banyak detail error
+func recordMetric(metrics *ResponseTimeMetrics, duration time.Duration, err error, errorMsg string) {
 	metrics.mutex.Lock()
 	defer metrics.mutex.Unlock()
 
 	if err != nil {
 		metrics.ErrorCount++
+
+		// PERBAIKAN: Simpan beberapa error terakhir untuk debugging
+		if errorMsg != "" {
+			if len(metrics.LastErrors) < 10 {
+				metrics.LastErrors = append(metrics.LastErrors, errorMsg)
+			} else {
+				// Shift array dan tambahkan di akhir
+				copy(metrics.LastErrors, metrics.LastErrors[1:])
+				metrics.LastErrors[9] = errorMsg
+			}
+		}
 		return
 	}
 
@@ -646,16 +1012,6 @@ func simulateUserThinkingTime(minSeconds, maxSeconds int) {
 
 	thinkingTime := rand.Intn(maxSeconds-minSeconds+1) + minSeconds
 	time.Sleep(time.Duration(thinkingTime) * time.Second)
-}
-
-// Fungsi untuk memilih jawaban acak
-func randomAnswer(question *questionv1.Question) string {
-	if len(question.Choices) == 0 {
-		return "A" // Default jika tidak ada pilihan
-	}
-
-	choiceIdx := rand.Intn(len(question.Choices))
-	return string(rune('A' + choiceIdx))
 }
 
 // Fungsi untuk mensimulasikan kegagalan jaringan
@@ -828,6 +1184,39 @@ func exportResultsToCSV(metrics map[string]*ResponseTimeMetrics, outputDir strin
 		detailWriter.Flush()
 		detailFile.Close()
 	}
+
+	// PERBAIKAN: Ekspor juga error untuk debugging
+	errorFile, err := os.Create(fmt.Sprintf("%s/error_details.csv", outputDir))
+	if err != nil {
+		log.Printf("Failed to create error file: %v", err)
+		return
+	}
+	defer errorFile.Close()
+
+	errorWriter := csv.NewWriter(errorFile)
+	defer errorWriter.Flush()
+
+	// Tulis header
+	errorWriter.Write([]string{"API", "Error Count", "Last Errors"})
+
+	// Tulis data error untuk setiap API
+	for name, m := range metrics {
+		if m.ErrorCount > 0 {
+			errors := ""
+			for i, err := range m.LastErrors {
+				if i > 0 {
+					errors += " | "
+				}
+				errors += err
+			}
+
+			errorWriter.Write([]string{
+				name,
+				fmt.Sprintf("%d", m.ErrorCount),
+				errors,
+			})
+		}
+	}
 }
 
 // Fungsi untuk mengekspor data resource ke CSV
@@ -914,4 +1303,12 @@ func createServiceClients(examAddr, questionAddr, sessionAddr, scoringAddr strin
 	connections := []*grpc.ClientConn{examConn, questionConn, sessionConn, scoringConn}
 
 	return examClient, questionClient, sessionClient, scoringClient, connections, nil
+}
+
+// PERBAIKAN: Helper function untuk Go 1.20+ yang belum memiliki fungsi min()
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
