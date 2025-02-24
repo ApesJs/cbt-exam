@@ -176,7 +176,7 @@ func TestExamSessionPerformance(t *testing.T) {
 
 				// Pilih jawaban (untuk simulasi)
 				choiceIndex := j % len(question.Choices)
-				selectedChoice := string('A' + choiceIndex)
+				selectedChoice := string(rune('A' + choiceIndex))
 
 				// Kirim jawaban
 				_, err := sessionClient.SubmitAnswer(context.Background(), &sessionv1.SubmitAnswerRequest{

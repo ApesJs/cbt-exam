@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	examv1 "github.com/ApesJs/cbt-exam/api/proto/exam/v1"
-	"github.com/ApesJs/cbt-exam/pkg/client"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	questionv1 "github.com/ApesJs/cbt-exam/api/proto/question/v1"
@@ -16,11 +15,11 @@ import (
 
 type questionService struct {
 	repo   repository.QuestionRepository
-	client *client.ServiceClient
+	client interface{}
 	questionv1.UnimplementedQuestionServiceServer
 }
 
-func NewQuestionService(repo repository.QuestionRepository, client *client.ServiceClient) questionv1.QuestionServiceServer {
+func NewQuestionService(repo repository.QuestionRepository, client interface{}) questionv1.QuestionServiceServer {
 	return &questionService{
 		repo:   repo,
 		client: client,
@@ -29,17 +28,21 @@ func NewQuestionService(repo repository.QuestionRepository, client *client.Servi
 
 func (s *questionService) CreateQuestion(ctx context.Context, req *questionv1.CreateQuestionRequest) (*questionv1.Question, error) {
 	// Validasi exam exists dan status
-	exam, err := s.client.GetExam(ctx, req.ExamId)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to validate exam: %v", err)
-	}
-	if exam == nil {
-		return nil, status.Error(codes.NotFound, "exam not found")
-	}
+	if client, ok := s.client.(interface {
+		GetExam(context.Context, string) (*examv1.Exam, error)
+	}); ok {
+		exam, err := client.GetExam(ctx, req.ExamId)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to validate exam: %v", err)
+		}
+		if exam == nil {
+			return nil, status.Error(codes.NotFound, "exam not found")
+		}
 
-	// Tidak boleh menambah soal jika ujian sudah aktif
-	if exam.Status.State == examv1.ExamState_EXAM_STATE_ACTIVE {
-		return nil, status.Error(codes.FailedPrecondition, "cannot add questions to active exam")
+		// Tidak boleh menambah soal jika ujian sudah aktif
+		if exam.Status.State == examv1.ExamState_EXAM_STATE_ACTIVE {
+			return nil, status.Error(codes.FailedPrecondition, "cannot add questions to active exam")
+		}
 	}
 
 	question := &domain.Question{
@@ -84,7 +87,6 @@ func (s *questionService) ListQuestions(ctx context.Context, req *questionv1.Lis
 		protoQuestions = append(protoQuestions, convertDomainToProto(q))
 	}
 
-	// Simple pagination using last question's ID as next page token
 	var nextPageToken string
 	if len(questions) == int(req.PageSize) {
 		nextPageToken = questions[len(questions)-1].ID
@@ -104,7 +106,6 @@ func (s *questionService) UpdateQuestion(ctx context.Context, req *questionv1.Up
 		CorrectAnswer: req.Question.CorrectAnswer,
 	}
 
-	// Convert choices from proto to domain
 	for _, c := range req.Question.Choices {
 		question.Choices = append(question.Choices, domain.Choice{
 			ID:   c.Id,
@@ -135,13 +136,17 @@ func (s *questionService) DeleteQuestion(ctx context.Context, req *questionv1.De
 
 func (s *questionService) GetExamQuestions(ctx context.Context, req *questionv1.GetExamQuestionsRequest) (*questionv1.GetExamQuestionsResponse, error) {
 	// Validasi exam exists dan status
-	isActive, err := s.client.IsExamActive(ctx, req.ExamId)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to validate exam: %v", err)
-	}
+	if client, ok := s.client.(interface {
+		IsExamActive(context.Context, string) (bool, error)
+	}); ok {
+		isActive, err := client.IsExamActive(ctx, req.ExamId)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to validate exam: %v", err)
+		}
 
-	if !isActive {
-		return nil, status.Error(codes.FailedPrecondition, "exam is not active")
+		if !isActive {
+			return nil, status.Error(codes.FailedPrecondition, "exam is not active")
+		}
 	}
 
 	filter := domain.QuestionFilter{
@@ -165,14 +170,13 @@ func (s *questionService) GetExamQuestions(ctx context.Context, req *questionv1.
 	}, nil
 }
 
-// Helper functions to convert between domain and proto models
+// Helper functions untuk konversi domain ke proto models
 func convertDomainToProto(q *domain.Question) *questionv1.Question {
 	protoQuestion := &questionv1.Question{
 		Id:            q.ID,
 		ExamId:        q.ExamID,
 		QuestionText:  q.QuestionText,
 		CorrectAnswer: q.CorrectAnswer,
-		//CreatedAt:     timestamppb.New(q.CreatedAt),
 	}
 
 	for _, c := range q.Choices {

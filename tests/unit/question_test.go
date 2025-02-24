@@ -19,6 +19,11 @@ import (
 	"github.com/ApesJs/cbt-exam/internal/question/service"
 )
 
+type ServiceClientInterface interface {
+	GetExam(ctx context.Context, examID string) (*examv1.Exam, error)
+	IsExamActive(ctx context.Context, examID string) (bool, error)
+}
+
 // MockQuestionRepository adalah struct mock untuk repository.QuestionRepository
 type MockQuestionRepository struct {
 	mock.Mock
@@ -421,6 +426,6 @@ func TestGetExamQuestionsExamNotActive(t *testing.T) {
 }
 
 // Helper function untuk membuat QuestionService
-func NewQuestionService(repo repository.QuestionRepository, client *MockServiceClient) questionv1.QuestionServiceServer {
-	return service.NewQuestionService(repo, client)
+func NewQuestionService(repo repository.QuestionRepository, client ServiceClientInterface) questionv1.QuestionServiceServer {
+	return service.NewQuestionService(repo, client.(interface{}))
 }
